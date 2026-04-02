@@ -20,6 +20,7 @@ from bs4 import BeautifulSoup
 
 import matplotlib
 
+from portfolio_tracker import __version__
 from portfolio_tracker.realized_pnl import SellRecord, apply_sell_to_portfolio, summarize_realized_pnl
 from portfolio_tracker.utils import (
     currency_formatter,
@@ -90,7 +91,7 @@ if TYPE_CHECKING:
 class PortfolioApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"실시간 포트폴리오 트래커 ({current_os} 모드)")
+        self.root.title(f"실시간 포트폴리오 트래커 v{__version__} ({current_os} 모드)")
         self.root.geometry("580x860")
 
         self.BG = "#101317"
@@ -114,6 +115,8 @@ class PortfolioApp:
         self.account_cash = []
         # 실현손익(매도) 기록(누적 저장): [{"sell_date": "...", "account": "...", ...}, ...]
         self.sell_records = self._load_sell_records_from_disk()
+        # 마지막으로 불러온/저장한 포트폴리오 JSON 경로(덮어쓰기 저장에 사용)
+        self.portfolio_json_path: str | None = None
 
         self.current_alpha = 0.1
         self.chart_win = None
@@ -132,6 +135,90 @@ class PortfolioApp:
         # 일부 환경에서는 초기 맵핑 직후 alpha가 무시되어 한 번 더 적용이 필요하다.
         self.root.after(50, self.apply_transparency)
         self.root.after(200, self.apply_transparency)
+
+    def _get_portfolio_name_by_account_ticker(self, account: str, ticker: str) -> str | None:
+        """
+        특정 계좌의 ticker에 대응하는 기존 종목명을 찾는다(없으면 None).
+        ticker는 대소문자/공백을 정규화해 비교한다.
+        """
+        acc = str(account or "").strip() or "일반 계좌"
+        t = str(ticker or "").strip()
+        if not t:
+            return None
+        t_up = t.upper()
+        for item in self.portfolio:
+            try:
+                item_acc = str(item.get("account", "")).strip() or "일반 계좌"
+                if item_acc != acc:
+                    continue
+                item_ticker = str(item.get("ticker", "")).strip()
+                if not item_ticker:
+                    continue
+                if item_ticker.upper() != t_up:
+                    continue
+                name = str(item.get("name", "")).strip()
+                return name or None
+            except Exception:
+                continue
+        return None
+
+    def _parse_ticker_from_combo_value(self, raw: str) -> str:
+        """
+        종목코드/티커 콤보박스 값에서 ticker만 추출한다.
+        표시 포맷: "TICKER | 종목명" (또는 사용자가 직접 입력한 ticker)
+        """
+        s = str(raw or "").strip()
+        if not s:
+            return ""
+        if "|" in s:
+            s = s.split("|", 1)[0].strip()
+        return s
+
+    def _find_portfolio_holding(self, account: str, ticker: str):
+        """
+        포트폴리오 리스트에서 (account, ticker) 매칭되는 holding(dict)과 인덱스를 반환.
+        없으면 (None, None).
+        """
+        acc = str(account or "").strip() or "일반 계좌"
+        t = str(ticker or "").strip().upper()
+        if not t:
+            return None, None
+        for i, item in enumerate(self.portfolio or []):
+            try:
+                item_acc = str(item.get("account", "")).strip() or "일반 계좌"
+                item_t = str(item.get("ticker", "")).strip().upper()
+                if item_acc == acc and item_t == t:
+                    return item, i
+            except Exception:
+                continue
+        return None, None
+
+    def _set_buy_ex_enabled(self, enabled: bool) -> None:
+        """
+        매입 환율 입력칸을 해외 종목에서만 활성화한다.
+        """
+        if not hasattr(self, "ent_buy_ex"):
+            return
+        try:
+            self.ent_buy_ex.config(state=("normal" if enabled else "disabled"))
+        except Exception:
+            pass
+        if hasattr(self, "lbl_buy_ex"):
+            try:
+                self.lbl_buy_ex.config(fg=(self.FG if enabled else self.MUTED))
+            except Exception:
+                pass
+
+    def _sync_buy_ex_enabled_from_ticker(self) -> None:
+        """
+        현재 티커 값 기준으로 매입 환율 입력칸 활성/비활성 상태를 동기화한다.
+        """
+        try:
+            ticker = self._parse_ticker_from_combo_value(str(self.ent_ticker.get()))
+        except Exception:
+            ticker = ""
+        # 국내(6자리)면 환율 입력 불필요 → disable
+        self._set_buy_ex_enabled(not is_korean_ticker(ticker))
 
     def _setup_styles(self):
         style = ttk.Style()
@@ -361,7 +448,14 @@ class PortfolioApp:
         self.ent_account.set("일반 계좌")
 
         self._make_label(frame_input, "종목코드/티커").grid(row=1, column=0, sticky='w')
-        self.ent_ticker = self._make_entry(frame_input)
+        # 계좌 선택 시 해당 계좌 보유 종목을 콤보박스로 선택할 수 있게 한다(직접 입력도 허용).
+        self.ent_ticker = ttk.Combobox(
+            frame_input,
+            font=self.FONT_MAIN,
+            state="normal",
+            values=[],
+            style="Modern.TCombobox",
+        )
         self.ent_ticker.grid(row=1, column=1, pady=5, padx=(10, 0), sticky="ew")
 
         self._make_label(frame_input, "종목명").grid(row=2, column=0, sticky='w')
@@ -376,6 +470,29 @@ class PortfolioApp:
         self.ent_avg = self._make_entry(frame_input)
         self.ent_avg.grid(row=4, column=1, pady=5, padx=(10, 0), sticky="ew")
 
+        self.lbl_buy_ex = self._make_label(frame_input, "매입 환율(KRW/USD)")
+        self.lbl_buy_ex.grid(row=5, column=0, sticky="w")
+        self.ent_buy_ex = self._make_entry(frame_input)
+        self.ent_buy_ex.grid(row=5, column=1, pady=5, padx=(10, 0), sticky="ew")
+        try:
+            self.ent_buy_ex.insert(0, f"{float(getattr(self, 'current_exchange_rate', 1400.0)):g}")
+        except Exception:
+            pass
+
+        # 추가매수 모드: 기존 보유 종목이면 (추가 매수수량, 매수가)만 입력해도 평단/수량을 자동 갱신한다.
+        self.add_buy_mode = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            frame_input,
+            text="추가매수 모드(기존 종목이면 평단/수량 자동계산)",
+            variable=self.add_buy_mode,
+            bg=self.CARD_BG,
+            fg=self.FG,
+            selectcolor=self.ENTRY_BG,
+            activebackground=self.CARD_BG,
+            activeforeground=self.FG,
+            font=self.FONT_CAPTION,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
         self._make_button(
             frame_input,
             text="주식/ETF 추가하기",
@@ -383,7 +500,16 @@ class PortfolioApp:
             bg=self.ACCENT,
             fg="#0D1117",
             bold=True
-        ).grid(row=5, column=0, columnspan=2, pady=(10, 4), sticky="ew")
+        ).grid(row=7, column=0, columnspan=2, pady=(10, 4), sticky="ew")
+
+        # 계좌 변경 → 티커 후보 갱신, 티커 선택/입력 → 종목명 자동 채움
+        self.ent_account.bind("<<ComboboxSelected>>", lambda _e=None: self.refresh_ticker_options())
+        self.ent_account.bind("<FocusOut>", lambda _e=None: self.refresh_ticker_options())
+        self.ent_ticker.bind("<<ComboboxSelected>>", lambda _e=None: (self._sync_buy_ex_enabled_from_ticker(), self._autofill_name_from_ticker()))
+        self.ent_ticker.bind("<FocusOut>", lambda _e=None: (self._sync_buy_ex_enabled_from_ticker(), self._autofill_name_from_ticker()))
+
+        # 초기 상태 동기화
+        self._sync_buy_ex_enabled_from_ticker()
 
         frame_cash = self._build_card_frame(self.main_content)
         frame_cash.pack(pady=6, fill='x', padx=20)
@@ -425,9 +551,16 @@ class PortfolioApp:
         ).pack(side='left', padx=(0, 8))
         self._make_button(
             frame_file,
+            text="💾 저장(덮어쓰기)",
+            command=self.save_to_current_json,
+            bg="#2E5A47",
+            bold=True
+        ).pack(side='left', padx=8)
+        self._make_button(
+            frame_file,
             text="💾 JSON 내보내기",
             command=self.save_to_json,
-            bg="#2E5A47",
+            bg="#2F6F5A",
             bold=True
         ).pack(side='left', padx=8)
         self._make_button(
@@ -571,6 +704,102 @@ class PortfolioApp:
 
         target = str(preferred_account or "").strip() or current_value or "일반 계좌"
         self.ent_account.set(target)
+        # 계좌 콤보박스 갱신 후, 해당 계좌의 티커 후보도 함께 갱신
+        self.refresh_ticker_options(preferred_account=target)
+
+    def refresh_ticker_options(self, preferred_account: str | None = None):
+        """
+        현재(또는 preferred_account) 계좌에 포함된 종목 ticker를 콤보박스 후보로 갱신한다.
+        """
+        account = str(preferred_account or "").strip() or str(self.ent_account.get()).strip() or "일반 계좌"
+        try:
+            current_ticker = self._parse_ticker_from_combo_value(str(self.ent_ticker.get() or ""))
+        except Exception:
+            current_ticker = ""
+
+        choices = []
+        try:
+            # (ticker, name, qty) 목록을 활용
+            for t, n, _q in self._portfolio_choices_for_account(account):
+                ts = str(t or "").strip()
+                ns = str(n or "").strip()
+                if ts:
+                    label = f"{ts} | {ns}" if ns else ts
+                    choices.append((ts, label))
+        except Exception:
+            choices = []
+
+        # ticker 기준 중복 제거 + 정렬
+        uniq_by_ticker = {}
+        for t, label in choices:
+            uniq_by_ticker[str(t).upper()] = label
+        labels = [uniq_by_ticker[k] for k in sorted(uniq_by_ticker.keys())]
+        try:
+            self.ent_ticker["values"] = labels
+        except Exception:
+            pass
+
+        if current_ticker and any(current_ticker.upper() == self._parse_ticker_from_combo_value(v).upper() for v in labels):
+            # 사용자가 이미 입력/선택한 값 유지
+            return
+        # 계좌 변경 직후에는 티커칸을 비워서 오입력 방지
+        try:
+            self.ent_ticker.set("")
+        except Exception:
+            try:
+                self.ent_ticker.delete(0, tk.END)
+            except Exception:
+                pass
+        self._sync_buy_ex_enabled_from_ticker()
+
+    def _autofill_name_from_ticker(self):
+        """
+        계좌/티커 기준으로 기존 종목명을 찾아 종목명 입력칸에 자동 반영한다.
+        """
+        account = str(self.ent_account.get()).strip() or "일반 계좌"
+        ticker = self._parse_ticker_from_combo_value(str(self.ent_ticker.get()))
+        holding, _idx = self._find_portfolio_holding(account, ticker)
+        if not holding:
+            return
+        try:
+            name = str(holding.get("name", "")).strip()
+            if name:
+                self.ent_name.delete(0, tk.END)
+                self.ent_name.insert(0, name)
+        except Exception:
+            pass
+        # 보유 수량/평단도 함께 표시(추가매수 시 바로 덮어쓰기 쉽게 전체 선택)
+        try:
+            qty = holding.get("qty", "")
+            avg = holding.get("avg_price", "")
+            if qty != "":
+                self.ent_qty.delete(0, tk.END)
+                self.ent_qty.insert(0, f"{float(qty):g}")
+                self.ent_qty.selection_range(0, tk.END)
+            if avg != "":
+                self.ent_avg.delete(0, tk.END)
+                # KR은 원단위일 수 있어 불필요한 .0 제거
+                try:
+                    av = float(avg)
+                    self.ent_avg.insert(0, f"{av:g}")
+                except Exception:
+                    self.ent_avg.insert(0, str(avg))
+                self.ent_avg.selection_range(0, tk.END)
+        except Exception:
+            pass
+        # 해외 종목이면 매입 환율도 자동 표시
+        try:
+            if not is_korean_ticker(ticker):
+                bex = holding.get("buy_exchange_rate", "")
+                if bex != "":
+                    self.ent_buy_ex.delete(0, tk.END)
+                    try:
+                        self.ent_buy_ex.insert(0, f"{float(bex):g}")
+                    except Exception:
+                        self.ent_buy_ex.insert(0, str(bex))
+                    self.ent_buy_ex.selection_range(0, tk.END)
+        except Exception:
+            pass
 
     def _show_pie_detail_popup(self, parent, title, body):
         if not body or not str(body).strip():
@@ -1012,7 +1241,7 @@ class PortfolioApp:
     # [수정] 자산 추가 시 '계좌명' 항목 포함
     def add_asset(self):
         account = self.ent_account.get().strip() or "일반 계좌"
-        ticker = self.ent_ticker.get().strip()
+        ticker = self._parse_ticker_from_combo_value(str(self.ent_ticker.get()))
         name = self.ent_name.get().strip()
         qty_str = self.ent_qty.get().strip()
         avg_str = self.ent_avg.get().strip()
@@ -1021,16 +1250,82 @@ class PortfolioApp:
         try:
             qty = float(qty_str.replace(',', ''))
             avg_price = float(avg_str.replace(',', ''))
-            asset = {'account': account, 'ticker': ticker, 'name': name, 'qty': qty, 'avg_price': avg_price}
-            if not is_korean_ticker(ticker):
-                asset['buy_exchange_rate'] = self.get_exchange_rate()
-            self.portfolio.append(asset)
-            unit = "원" if is_korean_ticker(ticker) else "$"
-            self.listbox.insert(tk.END, f"[{account}] {name} ({ticker}) | {qty}주 | 평단: {avg_price}{unit}")
-            self.ent_ticker.delete(0, tk.END)
+            buy_ex_input = None
+            try:
+                bex_str = str(getattr(self, "ent_buy_ex", None).get() if hasattr(self, "ent_buy_ex") else "").strip()
+                if bex_str:
+                    buy_ex_input = float(bex_str.replace(",", ""))
+            except Exception:
+                buy_ex_input = None
+
+            holding, idx = self._find_portfolio_holding(account, ticker)
+            is_buy_mode = bool(getattr(self, "add_buy_mode", tk.BooleanVar(value=False)).get())
+
+            # 기존 보유 종목이면: 입력값을 "추가 매수수량/매수가"로 보고 평단/수량 자동 갱신
+            if is_buy_mode and holding is not None and idx is not None:
+                old_qty = float(holding.get("qty", 0) or 0)
+                old_avg = float(holding.get("avg_price", 0) or 0)
+                buy_qty = qty
+                buy_price = avg_price
+                if buy_qty <= 0 or buy_price <= 0:
+                    return
+                new_qty = old_qty + buy_qty
+                if new_qty <= 0:
+                    return
+
+                if is_korean_ticker(ticker):
+                    new_avg = (old_qty * old_avg + buy_qty * buy_price) / new_qty
+                    holding["qty"] = new_qty
+                    holding["avg_price"] = new_avg
+                else:
+                    # US: avg_price(USD), buy_exchange_rate(KRW/USD)
+                    old_buy_ex = float(holding.get("buy_exchange_rate", 0) or 0)
+                    buy_ex = float(buy_ex_input or 0) if buy_ex_input else float(self.get_exchange_rate() or 0)
+                    if old_buy_ex <= 0:
+                        old_buy_ex = buy_ex if buy_ex > 0 else 0.0
+                    if buy_ex <= 0:
+                        buy_ex = old_buy_ex if old_buy_ex > 0 else 0.0
+
+                    total_usd_cost = old_qty * old_avg + buy_qty * buy_price
+                    new_avg = total_usd_cost / new_qty if new_qty > 0 else 0.0
+                    total_krw_cost = old_qty * old_avg * old_buy_ex + buy_qty * buy_price * buy_ex
+                    new_buy_ex = (total_krw_cost / total_usd_cost) if total_usd_cost > 0 else buy_ex
+
+                    holding["qty"] = new_qty
+                    holding["avg_price"] = new_avg
+                    holding["buy_exchange_rate"] = new_buy_ex
+
+                # 종목명은 기존 것을 우선 유지(사용자가 바꿨다면 업데이트)
+                if name and name != str(holding.get("name", "")).strip():
+                    holding["name"] = name
+
+                unit = "원" if is_korean_ticker(ticker) else "$"
+                self.listbox.insert(
+                    tk.END,
+                    f"[{account}] [추가매수] {holding.get('name','')} ({ticker}) | +{buy_qty:g}주 @ {buy_price:g}{unit} → "
+                    f"총 {float(holding.get('qty',0) or 0):g}주 / 평단 {float(holding.get('avg_price',0) or 0):g}{unit}",
+                )
+            else:
+                asset = {'account': account, 'ticker': ticker, 'name': name, 'qty': qty, 'avg_price': avg_price}
+                if not is_korean_ticker(ticker):
+                    # 해외 종목은 매입 환율 입력값이 있으면 우선 사용
+                    asset['buy_exchange_rate'] = float(buy_ex_input or 0) if buy_ex_input else self.get_exchange_rate()
+                self.portfolio.append(asset)
+                unit = "원" if is_korean_ticker(ticker) else "$"
+                self.listbox.insert(tk.END, f"[{account}] {name} ({ticker}) | {qty}주 | 평단: {avg_price}{unit}")
+
+            try:
+                self.ent_ticker.set("")
+            except Exception:
+                self.ent_ticker.delete(0, tk.END)
             self.ent_name.delete(0, tk.END)
             self.ent_qty.delete(0, tk.END)
             self.ent_avg.delete(0, tk.END)
+            try:
+                self.ent_buy_ex.delete(0, tk.END)
+                self.ent_buy_ex.insert(0, f"{float(getattr(self, 'current_exchange_rate', 1400.0)):g}")
+            except Exception:
+                pass
             self.refresh_account_options(preferred_account=account)
         except Exception:
             pass
@@ -1071,7 +1366,34 @@ class PortfolioApp:
         self.account_cash = []
         # sell_records는 누적 데이터이므로 clear_all에서 지우지 않는다.
         self.listbox.delete(0, tk.END)
+        # 입력칸도 함께 초기화(UI 리프래시)
+        try:
+            self.ent_account.set("일반 계좌")
+        except Exception:
+            pass
+        try:
+            self.ent_ticker.set("")
+        except Exception:
+            try:
+                self.ent_ticker.delete(0, tk.END)
+            except Exception:
+                pass
+        for ent in ("ent_name", "ent_qty", "ent_avg", "ent_krw", "ent_usd"):
+            try:
+                w = getattr(self, ent, None)
+                if w is not None:
+                    w.delete(0, tk.END)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "ent_buy_ex"):
+                self.ent_buy_ex.config(state="normal")
+                self.ent_buy_ex.delete(0, tk.END)
+                self.ent_buy_ex.insert(0, f"{float(getattr(self, 'current_exchange_rate', 1400.0)):g}")
+        except Exception:
+            pass
         self.refresh_account_options(preferred_account="일반 계좌")
+        self._sync_buy_ex_enabled_from_ticker()
 
     def save_to_json(self):
         filepath = filedialog.asksaveasfilename(defaultextension=".json", initialfile="my_portfolio.json")
@@ -1092,7 +1414,45 @@ class PortfolioApp:
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
+            # 내보낸 경로도 “현재 경로”로 간주(이후 덮어쓰기 저장 가능)
+            self.portfolio_json_path = filepath
             messagebox.showinfo("저장 완료", "포트폴리오가 저장되었습니다.")
+        except Exception:
+            pass
+
+    def save_to_current_json(self):
+        """
+        마지막으로 불러온/저장한 JSON 파일로 덮어쓰기 저장한다.
+        (경로가 없으면 기존 '내보내기(Save As)'로 유도)
+        """
+        path = self.portfolio_json_path
+        if not path:
+            # 아직 불러온 파일이 없으면 Save As로 처리
+            self.save_to_json()
+            return
+        try:
+            if not messagebox.askyesno("덮어쓰기 저장", f"아래 파일에 덮어써서 저장할까요?\n\n{path}"):
+                return
+        except Exception:
+            # askyesno가 실패하는 특이 케이스에서는 조용히 중단
+            return
+
+        self.update_rebalance_config_from_gui()
+        rebalance_ratios = dict(self.target_ratios)
+        data = {
+            "account_cash": self.account_cash,
+            "portfolio": self.portfolio,
+            # 실현손익 기록은 별도 누적 JSON로 관리하지만, 내보내기에는 포함(백업 용도)
+            "sell_records": self.sell_records,
+            "rebalance_enabled": bool(self.rebalance_enabled.get()),
+            "target_ratios": rebalance_ratios,
+            # input JSON 호환성을 위해 별칭 키도 함께 저장한다.
+            "rebalance_ratios": rebalance_ratios,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            messagebox.showinfo("저장 완료", "포트폴리오가 저장되었습니다. (덮어쓰기)")
         except Exception:
             pass
 
@@ -1106,6 +1466,7 @@ class PortfolioApp:
                 data = json.load(f)
             self.clear_all()
             self.portfolio = data.get("portfolio", [])
+            self.portfolio_json_path = filepath
             # sell_records는 누적 데이터이므로 기본적으로 디스크본을 유지한다.
             # 단, 가져온 JSON에 sell_records가 있으면 병합(중복 제거)하여 누적 데이터에 반영한다.
             incoming = data.get("sell_records", [])
@@ -2288,7 +2649,14 @@ class PortfolioApp:
                 r = float(pure_day_returns.iloc[i])
                 sign = "+" if r >= 0 else ""
                 lbl = "전일 순수 성과" if view_mode == "일간" else ("전주 순수 성과" if view_mode == "주간" else "전월 순수 성과")
-                return f"{_date_with_weekday_kr(dates[i])}\n{lbl}: {sign}{r:.2f}%"
+                # 입출금(net_flow) 제외한 전기 대비 원화 손익
+                dval = float((vals - prev_vals - net_flow).iloc[i]) if i < len(vals) else 0.0
+                dval_sign = "+" if dval >= 0 else ""
+                return (
+                    f"{_date_with_weekday_kr(dates[i])}\n"
+                    f"{lbl}: {sign}{r:.2f}%\n"
+                    f"{lbl} 원화손익: {dval_sign}{int(round(dval)):,}원"
+                )
 
             self._setup_line_series_hover(ax_roi, dates, rois.values, _roi_tip)
             self._setup_line_series_hover(ax_pure_day, dates, pure_day_returns.values, _pure_tip)
