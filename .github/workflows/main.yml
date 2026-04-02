@@ -5,6 +5,9 @@ on:
     branches: [ "main" ]
   workflow_dispatch: {}
 
+env:
+  APP_VERSION: "0.2"
+
 jobs:
   build:
     name: Build (${{ matrix.os }})
@@ -39,20 +42,20 @@ jobs:
 
       - name: Build (onefile)
         run: |
-          pyinstaller --noconfirm --clean --noconsole --onefile --name portfolio-tracker --hidden-import PIL.ImageTk --hidden-import PIL._imagingtk --hidden-import matplotlib.backends.backend_tkagg --hidden-import matplotlib.backends._backend_tk run_app.py
+          pyinstaller --noconfirm --clean --noconsole --onefile --name "portfolio-tracker-${{ env.APP_VERSION }}" --hidden-import PIL.ImageTk --hidden-import PIL._imagingtk --hidden-import matplotlib.backends.backend_tkagg --hidden-import matplotlib.backends._backend_tk run_app.py
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: portfolio-tracker-windows
-          path: dist/portfolio-tracker.exe
+          name: portfolio-tracker-${{ env.APP_VERSION }}-windows
+          path: dist/portfolio-tracker-${{ env.APP_VERSION }}.exe
           if-no-files-found: error
 
       - name: Upload artifact (Linux)
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: portfolio-tracker-linux
-          path: dist/portfolio-tracker
+          name: portfolio-tracker-${{ env.APP_VERSION }}-linux
+          path: dist/portfolio-tracker-${{ env.APP_VERSION }}
           if-no-files-found: error
