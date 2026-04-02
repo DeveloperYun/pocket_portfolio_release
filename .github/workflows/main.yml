@@ -1,0 +1,52 @@
+name: Build Desktop Binaries (Win/Linux/macOS)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux 바이너리는 glibc 하위 호환을 위해 상대적으로 낮은 버전에서 빌드한다.
+        os: [windows-latest, ubuntu-22.04]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow requests beautifulsoup4 yfinance pandas numpy matplotlib
+
+      - name: Build (onefile)
+        run: |
+          pyinstaller --noconfirm --clean --noconsole --onefile --name pocket_portfolio --hidden-import PIL.ImageTk --hidden-import PIL._imagingtk test.py
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocket-portfolio-windows
+          path: dist/pocket_portfolio.exe
+          if-no-files-found: error
+
+      - name: Upload artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocket-portfolio-${{ runner.os }}
+          path: dist/pocket_portfolio
+          if-no-files-found: error
