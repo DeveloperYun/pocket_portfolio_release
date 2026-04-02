@@ -1,0 +1,2454 @@
+from __future__ import annotations
+
+import datetime
+import json
+import math
+import os
+import signal
+import sys
+import traceback
+import tkinter as tk
+from collections import defaultdict
+from tkinter import filedialog, messagebox, ttk
+from typing import TYPE_CHECKING, List
+
+import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
+from bs4 import BeautifulSoup
+
+import matplotlib
+
+from portfolio_tracker.realized_pnl import SellRecord, apply_sell_to_portfolio, summarize_realized_pnl
+from portfolio_tracker.utils import (
+    currency_formatter,
+    current_os,
+    date_with_weekday_kr as _date_with_weekday_kr,
+    get_asset_category,
+    get_history_file_path,
+    get_realized_pnl_records_file_path,
+    is_kr_business_day as _is_kr_business_day,
+    is_korean_ticker,
+    kr_holiday_date_set as _kr_holiday_date_set,
+    normalize_account_cash_entry as _normalize_account_cash_entry,
+)
+
+
+def _configure_matplotlib_for_tk() -> None:
+    if current_os == "Linux":
+        matplotlib.use("TkAgg")
+
+    import matplotlib.dates as mdates
+    import matplotlib.font_manager as fm
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.ticker import FuncFormatter
+
+    # publish to module globals (used by PortfolioApp methods)
+    globals()["mdates"] = mdates
+    globals()["fm"] = fm
+    globals()["plt"] = plt
+    globals()["FigureCanvasTkAgg"] = FigureCanvasTkAgg
+    globals()["FuncFormatter"] = FuncFormatter
+
+    plt.style.use("dark_background")
+
+    try:
+        import matplotlib.backends._backend_tk as backend_tk
+
+        backend_tk.ImageTk.PhotoImage = tk.PhotoImage
+    except Exception:
+        pass
+
+    if current_os == "Windows":
+        plt.rcParams["font.family"] = "Malgun Gothic"
+    elif current_os == "Darwin":
+        plt.rcParams["font.family"] = "AppleGothic"
+    elif current_os == "Linux":
+        font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+        if os.path.exists(font_path):
+            try:
+                fe = fm.FontEntry(fname=font_path, name="NanumGothic")
+                fm.fontManager.ttflist.insert(0, fe)
+                plt.rcParams["font.family"] = "NanumGothic"
+            except Exception:
+                pass
+
+    plt.rcParams["font.size"] = 11
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+_configure_matplotlib_for_tk()
+
+if TYPE_CHECKING:
+    import matplotlib.dates as mdates  # noqa: F401
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: F401
+    from matplotlib.ticker import FuncFormatter  # noqa: F401
+
+
+class PortfolioApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"실시간 포트폴리오 트래커 ({current_os} 모드)")
+        self.root.geometry("580x860")
+
+        self.BG = "#101317"
+        self.FG = "#E6EDF3"
+        self.BTN_BG = "#2B3440"
+        self.ENTRY_BG = "#1B2430"
+        self.CARD_BG = "#151C24"
+        self.BORDER = "#273243"
+        self.ACCENT = "#57A6FF"
+        self.ACCENT_ALT = "#7EE787"
+        self.MUTED = "#8B949E"
+        self.FONT_TITLE = ("Helvetica" if current_os == "Linux" else "Malgun Gothic", 16, "bold")
+        self.FONT_MAIN = ("Helvetica" if current_os == "Linux" else "Malgun Gothic", 11)
+        self.FONT_CAPTION = (self.FONT_MAIN[0], 9)
+
+        self.root.configure(bg=self.BG)
+        self._setup_styles()
+
+        self.portfolio = []
+        # 계좌별 예수금: [{"account": str, "cash_krw": float, "cash_usd": float}, ...]
+        self.account_cash = []
+        # 실현손익(매도) 기록(누적 저장): [{"sell_date": "...", "account": "...", ...}, ...]
+        self.sell_records = self._load_sell_records_from_disk()
+
+        self.current_alpha = 0.1
+        self.chart_win = None
+        self.chart_auto_refresh_job = None
+        self.chart_auto_refresh_interval_ms = 30000
+        self.current_chart_view_mode = "일간"
+        self.report_text_widget = None
+        self.current_report_data = []
+        self.current_exchange_rate = 1400.0
+        self.rebalance_enabled = tk.BooleanVar(value=False)
+        self.target_ratios = {"주식": 20.0, "채권": 20.0, "금": 20.0, "원자재": 20.0, "현금성 자산": 20.0}
+
+        self.create_widgets()
+        self.bind_escape_to_close(self.root)
+        self.apply_transparency()
+        # 일부 환경에서는 초기 맵핑 직후 alpha가 무시되어 한 번 더 적용이 필요하다.
+        self.root.after(50, self.apply_transparency)
+        self.root.after(200, self.apply_transparency)
+
+    def _setup_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(
+            "Modern.TCombobox",
+            fieldbackground=self.ENTRY_BG,
+            background=self.BTN_BG,
+            foreground=self.FG,
+            bordercolor=self.BORDER,
+            arrowcolor=self.FG,
+            insertcolor=self.FG,
+            relief="flat",
+            padding=6,
+        )
+        style.map(
+            "Modern.TCombobox",
+            fieldbackground=[("readonly", self.ENTRY_BG), ("disabled", "#2A313C")],
+            foreground=[("disabled", self.MUTED)],
+            arrowcolor=[("disabled", self.MUTED)],
+        )
+
+    def _build_card_frame(self, parent):
+        frame = tk.Frame(
+            parent,
+            bg=self.CARD_BG,
+            highlightbackground=self.BORDER,
+            highlightthickness=1,
+            bd=0,
+            padx=14,
+            pady=12,
+        )
+        return frame
+
+    def _make_label(self, parent, text):
+        return tk.Label(parent, text=text, bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN)
+
+    def _make_entry(self, parent, width=None):
+        kwargs = {
+            "bg": self.ENTRY_BG,
+            "fg": self.FG,
+            "insertbackground": self.FG,
+            "font": self.FONT_MAIN,
+            "relief": "flat",
+            "highlightthickness": 1,
+            "highlightbackground": self.BORDER,
+            "highlightcolor": self.ACCENT,
+        }
+        if width is not None:
+            kwargs["width"] = width
+        return tk.Entry(parent, **kwargs)
+
+    def _make_button(self, parent, text, command, bg=None, fg=None, bold=False, pad=(8, 5)):
+        font = (self.FONT_MAIN[0], 10, "bold" if bold else "normal")
+        btn = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg or self.BTN_BG,
+            fg=fg or self.FG,
+            activebackground="#3B4656",
+            activeforeground=self.FG,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=pad[0],
+            pady=pad[1],
+            font=font,
+        )
+        return btn
+
+    def _setup_text_tags(self, txt, title_size=14, title_color=None, body_size=11):
+        title_color = title_color or self.ACCENT
+        txt.tag_config("title", font=(self.FONT_MAIN[0], title_size, "bold"), foreground=title_color)
+        txt.tag_config("up", foreground="#FF6B6B", font=(self.FONT_MAIN[0], body_size, "bold"))
+        txt.tag_config("down", foreground="#4D96FF", font=(self.FONT_MAIN[0], body_size, "bold"))
+        txt.tag_config("flat", foreground=self.FG)
+        # account popup 전용 태그(없는 곳에서 사용해도 무해)
+        txt.tag_config("acc_title", font=(self.FONT_MAIN[0], 12, "bold"), foreground="#00FFFF")
+
+    def _get_lowest_main_button_top(self):
+        """
+        메인 화면의 "아래 버튼 3개" 중 최하단 버튼의 top y좌표(스크린 기준)를 반환.
+        """
+        tops = []
+        for attr in ("btn_main_calc", "btn_main_reset", "alpha_scale"):
+            if hasattr(self, attr):
+                try:
+                    tops.append(getattr(self, attr).winfo_rooty())
+                except Exception:
+                    pass
+        return max(tops) if tops else None
+
+    def _resize_and_place_chart_win(self, win, desired_w=1100, desired_h=650, reserve_bottom=130):
+        """
+        차트 팝업이 열릴 때 메인 화면 아래 버튼 3개가 가려지지 않도록
+        화면 여유분(아래 여백)을 남겨서 크기/위치를 조정한다.
+        """
+        try:
+            self.root.update_idletasks()
+            win.update_idletasks()
+
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+
+            root_x = self.root.winfo_rootx()
+            root_y = self.root.winfo_rooty()
+            root_w = self.root.winfo_width()
+            root_h = self.root.winfo_height()
+
+            # 우선 메인 창 옆으로 배치해서 겹침 자체를 피한다.
+            margin = 12
+            usable_w = max(420, sw - 20)
+            usable_h = max(320, sh - 20)
+            w = min(desired_w, usable_w)
+            h = min(desired_h, usable_h)
+
+            right_x = root_x + root_w + margin
+            left_x = root_x - w - margin
+            top = max(10, min(root_y, sh - h - 10))
+
+            if right_x + w <= sw - 10:
+                # 메인 오른쪽에 충분한 공간
+                left = right_x
+                win.geometry(f"{w}x{h}+{left}+{top}")
+            elif left_x >= 10:
+                # 메인 왼쪽에 충분한 공간
+                left = left_x
+                win.geometry(f"{w}x{h}+{left}+{top}")
+            else:
+                # 좌우 공간이 모두 부족하면, 기존처럼 위쪽에 최대한 올려서 버튼 가림 최소화
+                popup_top = root_y + 40
+                lowest_btn_top = self._get_lowest_main_button_top()
+                if lowest_btn_top is not None:
+                    popup_max_bottom = lowest_btn_top - 6
+                else:
+                    popup_max_bottom = root_y + root_h - reserve_bottom
+                available_h = popup_max_bottom - popup_top
+                if available_h > 0:
+                    h = min(h, available_h)
+                left = max(10, min(root_x + 20, sw - w - 10))
+                win.geometry(f"{w}x{h}+{left}+{popup_top}")
+
+            win.update_idletasks()
+        except Exception:
+            # 최악의 경우, 기본 크기만 적용
+            try:
+                win.geometry(f"{desired_w}x{desired_h}")
+            except Exception:
+                pass
+
+    def create_widgets(self):
+        outer = tk.Frame(self.root, bg=self.BG)
+        outer.pack(fill='both', expand=True)
+
+        v_scroll = tk.Scrollbar(outer, orient='vertical')
+        v_scroll.pack(side='right', fill='y')
+
+        self.main_canvas = tk.Canvas(
+            outer,
+            bg=self.BG,
+            highlightthickness=0,
+            yscrollcommand=v_scroll.set
+        )
+        self.main_canvas.pack(side='left', fill='both', expand=True)
+        v_scroll.config(command=self.main_canvas.yview)
+
+        self.main_content = tk.Frame(self.main_canvas, bg=self.BG)
+        self.main_canvas_window = self.main_canvas.create_window(
+            (0, 0), window=self.main_content, anchor='nw'
+        )
+
+        def _on_content_configure(_event=None):
+            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            self.main_canvas.itemconfigure(self.main_canvas_window, width=event.width)
+
+        self.main_content.bind("<Configure>", _on_content_configure)
+        self.main_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            # Windows/macOS
+            if getattr(event, "delta", 0):
+                self.main_canvas.yview_scroll(int(-event.delta / 120), "units")
+            # Linux
+            elif getattr(event, "num", None) == 4:
+                self.main_canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                self.main_canvas.yview_scroll(1, "units")
+
+        for target in (self.main_canvas, self.main_content):
+            target.bind("<MouseWheel>", _on_mousewheel)
+            target.bind("<Button-4>", _on_mousewheel)
+            target.bind("<Button-5>", _on_mousewheel)
+
+        # 엔트리/리스트박스 등 내부 위젯에 포커스가 있어도 휠 스크롤 동작하도록 전역 바인딩
+        self.root.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", _on_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", _on_mousewheel, add="+")
+
+        tk.Label(
+            self.main_content,
+            text="실시간 자산 & 수익률 계산기",
+            font=self.FONT_TITLE,
+            bg=self.BG,
+            fg=self.FG
+        ).pack(pady=(14, 10))
+
+        frame_input = self._build_card_frame(self.main_content)
+        frame_input.pack(pady=6, fill='x', padx=20)
+        frame_input.columnconfigure(1, weight=1)
+
+        # [수정] 계좌명 입력란: 선택 + 직접 입력(Combobox)
+        self._make_label(frame_input, "계좌명").grid(row=0, column=0, sticky='w')
+        self.ent_account = ttk.Combobox(
+            frame_input,
+            font=self.FONT_MAIN,
+            state="normal",
+            values=["일반 계좌"],
+            style="Modern.TCombobox"
+        )
+        self.ent_account.grid(row=0, column=1, pady=5, padx=(10, 0), sticky="ew")
+        self.ent_account.set("일반 계좌")
+
+        self._make_label(frame_input, "종목코드/티커").grid(row=1, column=0, sticky='w')
+        self.ent_ticker = self._make_entry(frame_input)
+        self.ent_ticker.grid(row=1, column=1, pady=5, padx=(10, 0), sticky="ew")
+
+        self._make_label(frame_input, "종목명").grid(row=2, column=0, sticky='w')
+        self.ent_name = self._make_entry(frame_input)
+        self.ent_name.grid(row=2, column=1, pady=5, padx=(10, 0), sticky="ew")
+
+        self._make_label(frame_input, "보유 수량").grid(row=3, column=0, sticky='w')
+        self.ent_qty = self._make_entry(frame_input)
+        self.ent_qty.grid(row=3, column=1, pady=5, padx=(10, 0), sticky="ew")
+
+        self._make_label(frame_input, "평균단가 (원/달러)").grid(row=4, column=0, sticky='w')
+        self.ent_avg = self._make_entry(frame_input)
+        self.ent_avg.grid(row=4, column=1, pady=5, padx=(10, 0), sticky="ew")
+
+        self._make_button(
+            frame_input,
+            text="주식/ETF 추가하기",
+            command=self.add_asset,
+            bg=self.ACCENT,
+            fg="#0D1117",
+            bold=True
+        ).grid(row=5, column=0, columnspan=2, pady=(10, 4), sticky="ew")
+
+        frame_cash = self._build_card_frame(self.main_content)
+        frame_cash.pack(pady=6, fill='x', padx=20)
+        frame_cash.columnconfigure(1, weight=1)
+
+        self._make_label(frame_cash, "원화 예수금(KRW)").grid(row=0, column=0, sticky='w')
+        self.ent_krw = self._make_entry(frame_cash)
+        self.ent_krw.grid(row=0, column=1, pady=5, padx=(10, 0), sticky="ew")
+
+        self._make_label(frame_cash, "달러 예수금(USD)").grid(row=1, column=0, sticky='w')
+        self.ent_usd = self._make_entry(frame_cash)
+        self.ent_usd.grid(row=1, column=1, pady=5, padx=(10, 0), sticky="ew")
+
+        self._make_button(
+            frame_cash,
+            text="현금 자산 추가하기",
+            command=self.add_cash,
+            bg=self.ACCENT_ALT,
+            fg="#0D1117",
+            bold=True
+        ).grid(row=2, column=0, columnspan=2, pady=(10, 4), sticky="ew")
+        tk.Label(
+            frame_cash,
+            text="(위「계좌명」칸의 계좌에 예수금이 반영됩니다)",
+            bg=self.CARD_BG,
+            fg=self.MUTED,
+            font=self.FONT_CAPTION
+        ).grid(row=3, column=0, columnspan=2, sticky='w')
+
+        frame_file = tk.Frame(self.main_content, bg=self.BG)
+        frame_file.pack(pady=6, padx=20, fill="x")
+
+        self._make_button(
+            frame_file,
+            text="📂 JSON 불러오기",
+            command=self.load_from_json,
+            bg="#304B67",
+            bold=True
+        ).pack(side='left', padx=(0, 8))
+        self._make_button(
+            frame_file,
+            text="💾 JSON 내보내기",
+            command=self.save_to_json,
+            bg="#2E5A47",
+            bold=True
+        ).pack(side='left', padx=8)
+        self._make_button(
+            frame_file,
+            text="🧾 실현손익 리포트",
+            command=self.open_realized_pnl_report,
+            bg="#5B3B8C",
+            bold=True
+        ).pack(side='left', padx=8)
+
+        frame_rebal = self._build_card_frame(self.main_content)
+        frame_rebal.pack(pady=6, fill='x', padx=20)
+
+        tk.Checkbutton(
+            frame_rebal,
+            text="리밸런싱 가이드 ON/OFF",
+            variable=self.rebalance_enabled,
+            bg=self.CARD_BG,
+            fg=self.FG,
+            selectcolor=self.ENTRY_BG,
+            activebackground=self.CARD_BG,
+            activeforeground=self.FG,
+            font=self.FONT_MAIN
+        ).grid(row=0, column=0, columnspan=5, sticky='w', pady=(0, 6))
+
+        self._make_label(frame_rebal, "주식").grid(row=1, column=0, padx=3, sticky='w')
+        self.ent_ratio_stock = self._make_entry(frame_rebal, width=5)
+        self.ent_ratio_stock.grid(row=1, column=1, padx=3)
+        self.ent_ratio_stock.insert(0, "20")
+
+        self._make_label(frame_rebal, "채권").grid(row=1, column=2, padx=3, sticky='w')
+        self.ent_ratio_bond = self._make_entry(frame_rebal, width=5)
+        self.ent_ratio_bond.grid(row=1, column=3, padx=3)
+        self.ent_ratio_bond.insert(0, "20")
+
+        self._make_label(frame_rebal, "금").grid(row=2, column=0, padx=3, sticky='w')
+        self.ent_ratio_gold = self._make_entry(frame_rebal, width=5)
+        self.ent_ratio_gold.grid(row=2, column=1, padx=3)
+        self.ent_ratio_gold.insert(0, "20")
+
+        self._make_label(frame_rebal, "원자재").grid(row=2, column=2, padx=3, sticky='w')
+        self.ent_ratio_comm = self._make_entry(frame_rebal, width=5)
+        self.ent_ratio_comm.grid(row=2, column=3, padx=3)
+        self.ent_ratio_comm.insert(0, "20")
+
+        self._make_label(frame_rebal, "현금").grid(row=3, column=0, padx=3, sticky='w')
+        self.ent_ratio_cash = self._make_entry(frame_rebal, width=5)
+        self.ent_ratio_cash.grid(row=3, column=1, padx=3)
+        self.ent_ratio_cash.insert(0, "20")
+
+        self.listbox = tk.Listbox(
+            self.main_content,
+            bg=self.ENTRY_BG,
+            fg=self.FG,
+            font=(self.FONT_MAIN[0], 10),
+            height=7,
+            selectbackground="#2F81F7",
+            selectforeground=self.FG,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=self.BORDER,
+            highlightcolor=self.ACCENT
+        )
+        self.listbox.pack(fill='both', padx=20, pady=6)
+
+        self.lbl_status = tk.Label(
+            self.main_content,
+            text="자산을 추가하거나 JSON 파일을 불러오세요.",
+            bg=self.BG,
+            fg=self.MUTED,
+            font=self.FONT_MAIN
+        )
+        self.lbl_status.pack(pady=5)
+
+        frame_bottom = tk.Frame(self.main_content, bg=self.BG)
+        frame_bottom.pack(pady=10, padx=20, fill="x")
+
+        self.btn_main_calc = self._make_button(
+            frame_bottom,
+            text="📊 계산 및 차트/수익률 보기",
+            command=self.calculate_and_draw,
+            bg="#1F6FEB",
+            bold=True,
+            pad=(12, 7)
+        )
+        self.btn_main_calc.pack(side='left', padx=(0, 6))
+
+        self.btn_main_reset = self._make_button(
+            frame_bottom,
+            text="초기화",
+            command=self.clear_all,
+            bg="#6E2E2E"
+        )
+        self.btn_main_reset.pack(side='left', padx=6)
+
+        alpha_wrap = tk.Frame(frame_bottom, bg=self.BG)
+        alpha_wrap.pack(side='left', padx=(8, 0), fill='x', expand=True)
+        self.lbl_alpha = tk.Label(
+            alpha_wrap,
+            text="투명도: 100%",
+            bg=self.BG,
+            fg="#7EE787",
+            font=self.FONT_MAIN
+        )
+        self.lbl_alpha.pack(side='left', padx=(0, 8))
+        self.alpha_scale = tk.Scale(
+            alpha_wrap,
+            from_=5,
+            to=100,
+            orient='horizontal',
+            resolution=5,
+            showvalue=False,
+            command=self.on_alpha_slider_change,
+            bg=self.BG,
+            fg=self.FG,
+            troughcolor=self.ENTRY_BG,
+            highlightthickness=0,
+            activebackground=self.ACCENT,
+            font=self.FONT_CAPTION,
+            length=160
+        )
+        self.alpha_scale.set(int(round(self.current_alpha * 100)))
+        self.alpha_scale.pack(side='left', fill='x', expand=True)
+
+    def refresh_account_options(self, preferred_account=None):
+        accounts = set()
+        for item in self.portfolio:
+            acc = str(item.get("account", "")).strip() or "일반 계좌"
+            accounts.add(acc)
+        for ent in self.account_cash:
+            acc = str(ent.get("account", "")).strip() or "일반 계좌"
+            accounts.add(acc)
+        accounts.add("일반 계좌")
+
+        current_value = str(self.ent_account.get()).strip()
+        if current_value:
+            accounts.add(current_value)
+
+        sorted_accounts = sorted(accounts)
+        self.ent_account["values"] = sorted_accounts
+
+        target = str(preferred_account or "").strip() or current_value or "일반 계좌"
+        self.ent_account.set(target)
+
+    def _show_pie_detail_popup(self, parent, title, body):
+        if not body or not str(body).strip():
+            return
+        win = tk.Toplevel(parent)
+        win.title(title)
+        win.geometry("480x420")
+        win.configure(bg=self.BG)
+        self.bind_escape_to_close(win)
+        try:
+            win.attributes('-alpha', self.current_alpha)
+            win.after(100, lambda: win.attributes('-alpha', self.current_alpha))
+        except Exception:
+            pass
+        scrollbar = tk.Scrollbar(win)
+        scrollbar.pack(side='right', fill='y')
+        txt = tk.Text(
+            win,
+            bg=self.ENTRY_BG,
+            fg=self.FG,
+            font=(self.FONT_MAIN[0], 10),
+            wrap=tk.WORD,
+            yscrollcommand=scrollbar.set,
+            padx=12,
+            pady=12,
+        )
+        txt.pack(side='left', fill='both', expand=True)
+        scrollbar.config(command=txt.yview)
+        txt.insert(tk.END, body)
+        txt.config(state='disabled')
+
+    def _format_macro_category_breakdown(self, category):
+        """대분류 자산군에 포함된 예수금·종목과 평가금액을 텍스트로 정리한다."""
+        rows = []
+        total_cat = float(self.current_macro_alloc.get(category, 0.0))
+        ex = float(getattr(self, "current_exchange_rate", 1400.0))
+
+        if category == "현금성 자산":
+            for ent in self.account_cash:
+                acc = str(ent.get("account", "")).strip() or "일반 계좌"
+                ck = float(ent.get("cash_krw", 0) or 0)
+                cu = float(ent.get("cash_usd", 0) or 0)
+                if ck > 0:
+                    rows.append((f"예수금 (KRW) · {acc}", ck))
+                if cu > 0:
+                    rows.append((f"예수금 (USD→원화) · {acc}", cu * ex))
+
+        for d in self.current_report_data:
+            name = d.get("name", "")
+            if d.get("is_fixed"):
+                cat = get_asset_category(name, "")
+            else:
+                ticker = str(d.get("ticker", "")).strip()
+                cat = get_asset_category(name, ticker)
+            if cat != category:
+                continue
+            val = float(d.get("val", 0))
+            if d.get("is_fixed"):
+                desc = f"{name} [실물/고정]"
+            else:
+                ticker = str(d.get("ticker", "")).strip()
+                acc = d.get("account", "")
+                desc = f"{name} ({ticker})" if ticker else name
+                if acc:
+                    desc += f" · {acc}"
+            rows.append((desc, val))
+
+        rows.sort(key=lambda x: -x[1])
+        lines = [f"【{category}】 포함 종목 · 평가금액", "=" * 40, ""]
+        if not rows:
+            lines.append("(해당 자산군에 표시할 항목이 없습니다.)")
+        else:
+            for desc, val in rows:
+                pct = (val / total_cat * 100) if total_cat > 0 else 0.0
+                lines.append(f"• {desc}")
+                lines.append(f"    {int(val):,}원 ({pct:.1f}%)")
+            lines.append("")
+            lines.append(f"합계 (자산군): {int(round(total_cat)):,}원")
+        return "\n".join(lines)
+
+    def _format_stock_pie_slice_breakdown(self, slice_label, slice_total):
+        """종목별 원형 차트의 한 조각(이름 또는 '현금 및 현금성 자산')에 대한 내역."""
+        slice_total = float(slice_total)
+        if slice_label == "현금 및 현금성 자산":
+            return self._format_macro_category_breakdown("현금성 자산")
+
+        rows = []
+        for d in self.current_report_data:
+            name = d.get("name", "")
+            if d.get("is_fixed"):
+                if name != slice_label:
+                    continue
+                val = float(d.get("val", 0))
+                rows.append((f"{name} [실물/고정]", val))
+            else:
+                if name != slice_label:
+                    continue
+                val = float(d.get("val", 0))
+                ticker = str(d.get("ticker", "")).strip()
+                acc = d.get("account", "")
+                desc = f"{name} ({ticker})" if ticker else name
+                if acc:
+                    desc += f" · {acc}"
+                rows.append((desc, val))
+
+        rows.sort(key=lambda x: -x[1])
+        lines = [f"【{slice_label}】 보유 내역", "=" * 40, ""]
+        if not rows:
+            lines.append("(표시할 항목이 없습니다.)")
+        else:
+            for desc, val in rows:
+                pct = (val / slice_total * 100) if slice_total > 0 else 0.0
+                lines.append(f"• {desc}")
+                lines.append(f"    {int(val):,}원 ({pct:.1f}%)")
+            lines.append("")
+            lines.append(f"조각 합계: {int(round(slice_total)):,}원")
+        return "\n".join(lines)
+
+    def _setup_pie_hover(self, canvas, fig, ax, wedges, labels, sizes, parent_win=None, on_wedge_click=None):
+        total = sum(sizes)
+        annot = ax.annotate(
+            "",
+            xy=(0, 0),
+            fontsize=11,
+            fontweight='bold',
+            color='white',
+            ha='center',
+            va='center',
+            bbox=dict(boxstyle="round,pad=0.4", fc=self.BTN_BG, ec="white", lw=1.5, alpha=0.95),
+        )
+        annot.set_visible(False)
+
+        prev_idx = [None]
+
+        def on_hover(event):
+            if event.inaxes != ax:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    for w in wedges:
+                        w.set_alpha(1.0)
+                    canvas.draw_idle()
+                    prev_idx[0] = None
+                return
+
+            for i, w in enumerate(wedges):
+                hit, _ = w.contains(event)
+                if hit:
+                    if prev_idx[0] == i:
+                        return
+                    prev_idx[0] = i
+                    pct = sizes[i] / total * 100
+                    text = f"{labels[i]}\n{int(sizes[i]):,}원 ({pct:.1f}%)"
+                    theta = (w.theta1 + w.theta2) / 2
+                    r = 0.5
+                    x = r * math.cos(math.radians(theta))
+                    y = r * math.sin(math.radians(theta))
+                    annot.xy = (x, y)
+                    annot.set_text(text)
+                    annot.set_visible(True)
+                    for j, ww in enumerate(wedges):
+                        ww.set_alpha(0.4 if j != i else 1.0)
+                    canvas.draw_idle()
+                    return
+
+            if annot.get_visible():
+                annot.set_visible(False)
+                for w in wedges:
+                    w.set_alpha(1.0)
+                canvas.draw_idle()
+                prev_idx[0] = None
+
+        def on_click(event):
+            if on_wedge_click is None or parent_win is None:
+                return
+            if event.inaxes != ax or event.button != 1:
+                return
+            for i, w in enumerate(wedges):
+                hit, _ = w.contains(event)
+                if hit:
+                    on_wedge_click(i)
+                    return
+
+        fig.canvas.mpl_connect('motion_notify_event', on_hover)
+        fig.canvas.mpl_connect('button_press_event', on_click)
+
+    def _disconnect_line_chart_hovers(self):
+        for cid in getattr(self, "_line_chart_hover_cids", []):
+            try:
+                self.canvas_line.mpl_disconnect(cid)
+            except Exception:
+                pass
+        self._line_chart_hover_cids = []
+
+    def _setup_line_series_hover(self, ax, dates, y_values, build_tooltip, pick_px=22.0):
+        """단일 Y 꺾은선: 가까운 마커에 대해 build_tooltip(i) 문자열을 툴팁으로 표시."""
+        n = len(dates)
+        if n == 0 or not hasattr(self, "canvas_line"):
+            return
+
+        canvas = self.canvas_line
+        if not hasattr(self, "_line_chart_hover_cids"):
+            self._line_chart_hover_cids = []
+
+        annot = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(10, 10),
+            textcoords="offset points",
+            fontsize=9,
+            color="white",
+            ha="left",
+            va="bottom",
+            bbox=dict(boxstyle="round,pad=0.35", fc=self.BTN_BG, ec="white", lw=1, alpha=0.95),
+            zorder=100,
+        )
+        annot.set_clip_on(False)
+        annot.set_visible(False)
+
+        x_nums = mdates.date2num(pd.DatetimeIndex(dates))
+        yv = np.asarray(y_values, dtype=float)
+        prev_idx = [None]
+
+        def on_hover(event):
+            if event.inaxes != ax:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    canvas.draw_idle()
+                    prev_idx[0] = None
+                return
+
+            best_i = None
+            best_d = pick_px + 1.0
+            for i in range(n):
+                try:
+                    px, py = ax.transData.transform((x_nums[i], yv[i]))
+                except Exception:
+                    continue
+                dist = math.hypot(event.x - px, event.y - py)
+                if dist < best_d:
+                    best_d = dist
+                    best_i = i
+
+            if best_i is None or best_d > pick_px:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    canvas.draw_idle()
+                    prev_idx[0] = None
+                return
+
+            if prev_idx[0] == best_i and annot.get_visible():
+                return
+            prev_idx[0] = best_i
+
+            annot.xy = (x_nums[best_i], yv[best_i])
+            annot.set_text(build_tooltip(best_i))
+
+            x0, x1 = ax.get_xlim()
+            span = (x1 - x0) or 1.0
+            x_frac = (x_nums[best_i] - x0) / span
+            _off = ((-12, 10) if x_frac > 0.62 else (12, 10))
+            if hasattr(annot, "xyann"):
+                annot.xyann = _off
+            else:
+                annot.xytext = _off
+            annot.set_ha("right" if x_frac > 0.62 else "left")
+            annot.set_visible(True)
+            canvas.draw_idle()
+
+        cid = canvas.mpl_connect("motion_notify_event", on_hover)
+        self._line_chart_hover_cids.append(cid)
+
+    def _setup_line_chart_val_hover(self, ax_val, dates, prins, vals):
+        """
+        자산 규모(원금·평가금) 꺾은선이 겹쳐 보일 때, 마우스 근처 시점의 원금·평가금을 툴팁으로 표시한다.
+        """
+        n = len(dates)
+        if n == 0 or not hasattr(self, "canvas_line"):
+            return
+
+        canvas = self.canvas_line
+        if not hasattr(self, "_line_chart_hover_cids"):
+            self._line_chart_hover_cids = []
+
+        annot = ax_val.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(10, 10),
+            textcoords="offset points",
+            fontsize=9,
+            color="white",
+            ha="left",
+            va="bottom",
+            bbox=dict(boxstyle="round,pad=0.35", fc=self.BTN_BG, ec="white", lw=1, alpha=0.95),
+            zorder=100,
+        )
+        annot.set_clip_on(False)
+        annot.set_visible(False)
+
+        x_nums = mdates.date2num(pd.DatetimeIndex(dates))
+        pr = np.asarray(prins, dtype=float)
+        va = np.asarray(vals, dtype=float)
+        prev_idx = [None]
+        pick_px = 22.0
+
+        def on_hover(event):
+            if event.inaxes != ax_val:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    canvas.draw_idle()
+                    prev_idx[0] = None
+                return
+
+            best_i = None
+            best_d = pick_px + 1.0
+            for i in range(n):
+                for y in (pr[i], va[i]):
+                    try:
+                        px, py = ax_val.transData.transform((x_nums[i], y))
+                    except Exception:
+                        continue
+                    d = math.hypot(event.x - px, event.y - py)
+                    if d < best_d:
+                        best_d = d
+                        best_i = i
+
+            if best_i is None or best_d > pick_px:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    canvas.draw_idle()
+                    prev_idx[0] = None
+                return
+
+            if prev_idx[0] == best_i and annot.get_visible():
+                return
+            prev_idx[0] = best_i
+
+            dstr = _date_with_weekday_kr(dates[best_i])
+            annot.xy = (x_nums[best_i], max(pr[best_i], va[best_i]))
+            annot.set_text(f"{dstr}\n투자원금: {int(pr[best_i]):,}원\n평가금: {int(va[best_i]):,}원")
+            x0, x1 = ax_val.get_xlim()
+            span = (x1 - x0) or 1.0
+            x_frac = (x_nums[best_i] - x0) / span
+            _off = ((-12, 10) if x_frac > 0.62 else (12, 10))
+            if hasattr(annot, "xyann"):
+                annot.xyann = _off
+            else:
+                annot.xytext = _off
+            annot.set_ha("right" if x_frac > 0.62 else "left")
+            annot.set_visible(True)
+            canvas.draw_idle()
+
+        cid = canvas.mpl_connect("motion_notify_event", on_hover)
+        self._line_chart_hover_cids.append(cid)
+
+    def on_alpha_slider_change(self, value):
+        try:
+            raw = float(value)
+            snapped = int(round(raw / 5.0) * 5)
+            snapped = min(100, max(5, snapped))
+            if abs(raw - snapped) > 0.01:
+                # Scale 콜백 값은 실수일 수 있어 5 단위로 강제 스냅한다.
+                self.alpha_scale.set(snapped)
+                return
+            self.current_alpha = snapped / 100.0
+        except Exception:
+            return
+        self.apply_transparency()
+
+    def apply_transparency(self):
+        try:
+            self.root.attributes('-alpha', self.current_alpha)
+            alpha_percent = int(round(self.current_alpha * 100))
+            alpha_percent = min(100, max(5, alpha_percent))
+            if hasattr(self, "lbl_alpha"):
+                self.lbl_alpha.config(text=f"투명도: {alpha_percent}%")
+            if hasattr(self, "alpha_scale") and int(self.alpha_scale.get()) != alpha_percent:
+                self.alpha_scale.set(alpha_percent)
+            for child in self.root.winfo_children():
+                if isinstance(child, tk.Toplevel):
+                    child.attributes('-alpha', self.current_alpha)
+        except Exception:
+            pass
+
+    def bind_escape_to_close(self, window):
+        try:
+            window.bind("<Escape>", lambda event, w=window: w.destroy())
+        except Exception:
+            pass
+
+    def _cancel_chart_auto_refresh(self):
+        if self.chart_auto_refresh_job and self.root.winfo_exists():
+            try:
+                self.root.after_cancel(self.chart_auto_refresh_job)
+            except Exception:
+                pass
+        self.chart_auto_refresh_job = None
+
+    def _schedule_chart_auto_refresh(self):
+        self._cancel_chart_auto_refresh()
+        if not (self.chart_win and self.chart_win.winfo_exists()):
+            return
+        self.chart_auto_refresh_job = self.root.after(
+            self.chart_auto_refresh_interval_ms,
+            self._on_chart_auto_refresh
+        )
+
+    def _on_chart_auto_refresh(self):
+        self.chart_auto_refresh_job = None
+        if not (self.chart_win and self.chart_win.winfo_exists()):
+            return
+        try:
+            self.lbl_status.config(text="그래프 자동 갱신 중... (30초 주기)", fg="#87CEFA")
+            self.calculate_and_draw(in_place_refresh=True)
+        except Exception:
+            self.lbl_status.config(text="자동 갱신 실패 - 다음 주기에 재시도", fg="#FF6B6B")
+            self._schedule_chart_auto_refresh()
+
+    def _close_chart_window(self):
+        self._cancel_chart_auto_refresh()
+        try:
+            if self.chart_win and self.chart_win.winfo_exists():
+                self.chart_win.destroy()
+        except Exception:
+            pass
+        self.chart_win = None
+        self.report_text_widget = None
+
+    def refresh_report_on_click(self):
+        if not (self.chart_win and self.chart_win.winfo_exists()):
+            self.lbl_status.config(text="보고서 창이 열려있지 않습니다.", fg="#FF6B6B")
+            return
+        try:
+            self.lbl_status.config(text="보고서 수동 갱신 중...", fg="#87CEFA")
+            self.root.update_idletasks()
+            self.calculate_and_draw(in_place_refresh=True)
+        except Exception:
+            self.lbl_status.config(text="수동 갱신 실패", fg="#FF6B6B")
+
+    # [수정] 자산 추가 시 '계좌명' 항목 포함
+    def add_asset(self):
+        account = self.ent_account.get().strip() or "일반 계좌"
+        ticker = self.ent_ticker.get().strip()
+        name = self.ent_name.get().strip()
+        qty_str = self.ent_qty.get().strip()
+        avg_str = self.ent_avg.get().strip()
+        if not ticker or not name or not qty_str or not avg_str:
+            return
+        try:
+            qty = float(qty_str.replace(',', ''))
+            avg_price = float(avg_str.replace(',', ''))
+            asset = {'account': account, 'ticker': ticker, 'name': name, 'qty': qty, 'avg_price': avg_price}
+            if not is_korean_ticker(ticker):
+                asset['buy_exchange_rate'] = self.get_exchange_rate()
+            self.portfolio.append(asset)
+            unit = "원" if is_korean_ticker(ticker) else "$"
+            self.listbox.insert(tk.END, f"[{account}] {name} ({ticker}) | {qty}주 | 평단: {avg_price}{unit}")
+            self.ent_ticker.delete(0, tk.END)
+            self.ent_name.delete(0, tk.END)
+            self.ent_qty.delete(0, tk.END)
+            self.ent_avg.delete(0, tk.END)
+            self.refresh_account_options(preferred_account=account)
+        except Exception:
+            pass
+
+    def add_cash(self):
+        try:
+            account = self.ent_account.get().strip() or "일반 계좌"
+            krw_str = self.ent_krw.get().strip() or "0"
+            usd_str = self.ent_usd.get().strip() or "0"
+            krw = float(krw_str.replace(',', ''))
+            usd = float(usd_str.replace(',', ''))
+            if krw == 0 and usd == 0:
+                return
+            ex = self.get_exchange_rate() if usd != 0 else 0.0
+            merged = None
+            for e in self.account_cash:
+                if e.get("account") == account:
+                    e["cash_krw"] = float(e.get("cash_krw", 0)) + krw
+                    e["cash_usd"] = float(e.get("cash_usd", 0)) + usd
+                    e["usd_cost_krw"] = float(e.get("usd_cost_krw", 0)) + (usd * ex)
+                    merged = e
+                    break
+            if merged is None:
+                merged = {"account": account, "cash_krw": krw, "cash_usd": usd, "usd_cost_krw": usd * ex}
+                self.account_cash.append(merged)
+            self.ent_krw.delete(0, tk.END)
+            self.ent_usd.delete(0, tk.END)
+            self.listbox.insert(
+                tk.END,
+                f"[예수금] {account} | 누적 KRW {merged['cash_krw']:,.0f} / USD {merged['cash_usd']:,.2f}"
+            )
+            self.refresh_account_options(preferred_account=account)
+        except Exception:
+            pass
+
+    def clear_all(self):
+        self.portfolio.clear()
+        self.account_cash = []
+        # sell_records는 누적 데이터이므로 clear_all에서 지우지 않는다.
+        self.listbox.delete(0, tk.END)
+        self.refresh_account_options(preferred_account="일반 계좌")
+
+    def save_to_json(self):
+        filepath = filedialog.asksaveasfilename(defaultextension=".json", initialfile="my_portfolio.json")
+        if not filepath:
+            return
+        self.update_rebalance_config_from_gui()
+        rebalance_ratios = dict(self.target_ratios)
+        data = {
+            "account_cash": self.account_cash,
+            "portfolio": self.portfolio,
+            # 실현손익 기록은 별도 누적 JSON로 관리하지만, 내보내기에는 포함(백업 용도)
+            "sell_records": self.sell_records,
+            "rebalance_enabled": bool(self.rebalance_enabled.get()),
+            "target_ratios": rebalance_ratios,
+            # input JSON 호환성을 위해 별칭 키도 함께 저장한다.
+            "rebalance_ratios": rebalance_ratios
+        }
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            messagebox.showinfo("저장 완료", "포트폴리오가 저장되었습니다.")
+        except Exception:
+            pass
+
+    # [수정] JSON 불러올 때 'account' 키 인식하여 Listbox에 표시
+    def load_from_json(self):
+        filepath = filedialog.askopenfilename(filetypes=[("JSON 파일", "*.json")])
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.clear_all()
+            self.portfolio = data.get("portfolio", [])
+            # sell_records는 누적 데이터이므로 기본적으로 디스크본을 유지한다.
+            # 단, 가져온 JSON에 sell_records가 있으면 병합(중복 제거)하여 누적 데이터에 반영한다.
+            incoming = data.get("sell_records", [])
+            if isinstance(incoming, list) and incoming:
+                self._merge_and_persist_sell_records(incoming)
+            raw_cash = data.get("account_cash")
+            self.account_cash = []
+            if isinstance(raw_cash, list):
+                for item in raw_cash:
+                    ent = _normalize_account_cash_entry(item)
+                    if ent:
+                        self.account_cash.append(ent)
+            legacy_krw = float(data.get("cash_krw", 0.0) or 0.0)
+            legacy_usd = float(data.get("cash_usd", 0.0) or 0.0)
+            if not self.account_cash and (legacy_krw != 0 or legacy_usd != 0):
+                self.account_cash.append({
+                    "account": "예수금 (레거시 통합)",
+                    "cash_krw": legacy_krw,
+                    "cash_usd": legacy_usd
+                })
+            self.rebalance_enabled.set(bool(data.get("rebalance_enabled", False)))
+            loaded_ratios = self._load_target_ratios_from_json(data)
+            for k, v in loaded_ratios.items():
+                self.target_ratios[k] = v
+            self.sync_rebalance_entries_from_config()
+            for ent in self.account_cash:
+                acc = ent.get("account", "일반 계좌")
+                ck = float(ent.get("cash_krw", 0) or 0)
+                cu = float(ent.get("cash_usd", 0) or 0)
+                self.listbox.insert(tk.END, f"[예수금] {acc} | KRW {ck:,.0f} / USD {cu:,.2f}")
+            for item in self.portfolio:
+                account = item.get('account', '일반 계좌')
+                name = item.get('name', '')
+                ticker = str(item.get('ticker', '')).strip()
+                if ticker.upper() == "FIXED":
+                    qty = item.get("qty", None)
+                    avg_price = item.get("avg_price", None)
+                    if qty is not None and avg_price is not None:
+                        try:
+                            self.listbox.insert(
+                                tk.END,
+                                f"[{account}] [실물/고정자산] {name} | 수량: {float(qty):g} | 단가: {float(avg_price):,.0f}원"
+                            )
+                        except Exception:
+                            self.listbox.insert(tk.END, f"[{account}] [실물/고정자산] {name}")
+                    else:
+                        self.listbox.insert(tk.END, f"[{account}] [실물/고정자산] {name}")
+                else:
+                    unit = "원" if is_korean_ticker(ticker) else "$"
+                    self.listbox.insert(
+                        tk.END,
+                        f"[{account}] {name} ({ticker}) | {item.get('qty',0)}주 | 평단: {item.get('avg_price',0)}{unit}"
+                    )
+            self.refresh_account_options()
+        except Exception:
+            pass
+
+    def _sell_record_dedupe_key(self, d):
+        try:
+            # 충분히 안정적인 키(문자열화). 실사용에서는 체결ID가 없으니 이 정도로 중복 제거.
+            return (
+                str(d.get("sell_date", "")).strip(),
+                str(d.get("account", "")).strip(),
+                str(d.get("ticker", "")).strip().upper(),
+                str(d.get("name", "")).strip(),
+                float(d.get("qty", 0) or 0),
+                float(d.get("sell_price", 0) or 0),
+                bool(d.get("is_us", False)),
+                float(d.get("sell_exchange_rate", 0) or 0) if d.get("sell_exchange_rate") not in (None, "") else 0.0,
+                float(d.get("fee_krw", 0) or 0),
+                str(d.get("memo", "") or "").strip(),
+            )
+        except Exception:
+            return ("__bad__", id(d))
+
+    def _load_sell_records_from_disk(self):
+        path = get_realized_pnl_records_file_path()
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                return []
+            # 정규화 가능한 항목만 유지
+            out = []
+            for raw in data:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    rec = SellRecord.from_json(raw)
+                    out.append(rec.to_json())
+                except Exception:
+                    continue
+            # 중복 제거
+            uniq = {}
+            for r in out:
+                uniq[self._sell_record_dedupe_key(r)] = r
+            return list(uniq.values())
+        except Exception:
+            return []
+
+    def _save_sell_records_to_disk(self):
+        path = get_realized_pnl_records_file_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.sell_records, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _merge_and_persist_sell_records(self, incoming_list):
+        existing = list(self.sell_records or [])
+        merged = []
+        for raw in existing:
+            if isinstance(raw, dict):
+                merged.append(raw)
+        for raw in incoming_list:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                merged.append(SellRecord.from_json(raw).to_json())
+            except Exception:
+                continue
+        uniq = {}
+        for r in merged:
+            uniq[self._sell_record_dedupe_key(r)] = r
+        self.sell_records = list(uniq.values())
+        self._save_sell_records_to_disk()
+
+    def _portfolio_choices_for_account(self, account: str):
+        account = str(account or "").strip() or "일반 계좌"
+        rows = []
+        for item in self.portfolio:
+            acc = str(item.get("account", "")).strip() or "일반 계좌"
+            if acc != account:
+                continue
+            ticker = str(item.get("ticker", "")).strip()
+            if not ticker or ticker.upper() == "FIXED":
+                continue
+            name = str(item.get("name", "")).strip()
+            qty = float(item.get("qty", 0) or 0)
+            rows.append((ticker, name, qty))
+        rows.sort(key=lambda x: (x[1], x[0]))
+        return rows
+
+    def open_realized_pnl_report(self):
+        """
+        매도 기록 입력 + 기간별(일/주/월/년) 실현손익 요약을 보여준다.
+        해외 종목은 매도환율(sell_exchange_rate)을 함께 기록해 KRW 기준 손익을 계산한다.
+        """
+        win = tk.Toplevel(self.root)
+        win.title("🧾 실현손익 리포트")
+        win.geometry("720x680")
+        win.configure(bg=self.BG)
+        self.bind_escape_to_close(win)
+        try:
+            win.attributes('-alpha', self.current_alpha)
+            win.after(100, lambda: win.attributes('-alpha', self.current_alpha))
+        except Exception:
+            pass
+
+        top = self._build_card_frame(win)
+        top.pack(fill="x", padx=12, pady=(12, 8))
+        top.columnconfigure(1, weight=1)
+        top.columnconfigure(3, weight=1)
+
+        tk.Label(top, text="계좌", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=0, column=0, sticky="w")
+        ent_acc = ttk.Combobox(
+            top,
+            font=self.FONT_MAIN,
+            state="readonly",
+            values=list(self.ent_account["values"]),
+            style="Modern.TCombobox",
+        )
+        ent_acc.grid(row=0, column=1, padx=(8, 10), pady=4, sticky="ew")
+        ent_acc.set(str(self.ent_account.get()).strip() or "일반 계좌")
+
+        tk.Label(top, text="매도일", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=0, column=2, sticky="w")
+        ent_date = self._make_entry(top, width=12)
+        ent_date.grid(row=0, column=3, padx=(8, 0), pady=4, sticky="w")
+        ent_date.insert(0, datetime.date.today().strftime("%Y-%m-%d"))
+
+        tk.Label(top, text="종목", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=1, column=0, sticky="w")
+        ent_ticker = ttk.Combobox(top, font=self.FONT_MAIN, state="readonly", values=[], style="Modern.TCombobox")
+        ent_ticker.grid(row=1, column=1, padx=(8, 10), pady=4, sticky="ew")
+
+        tk.Label(top, text="매도수량", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=1, column=2, sticky="w")
+        ent_qty = self._make_entry(top, width=12)
+        ent_qty.grid(row=1, column=3, padx=(8, 0), pady=4, sticky="w")
+
+        tk.Label(top, text="매도가", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=2, column=0, sticky="w")
+        ent_price = self._make_entry(top, width=18)
+        ent_price.grid(row=2, column=1, padx=(8, 10), pady=4, sticky="w")
+
+        tk.Label(top, text="매도환율(해외)", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=2, column=2, sticky="w")
+        ent_sell_ex = self._make_entry(top, width=12)
+        ent_sell_ex.grid(row=2, column=3, padx=(8, 0), pady=4, sticky="w")
+        try:
+            ent_sell_ex.insert(0, f"{self.get_exchange_rate():.2f}")
+        except Exception:
+            ent_sell_ex.insert(0, "1400")
+
+        tk.Label(top, text="수수료(원)", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=3, column=0, sticky="w")
+        ent_fee = self._make_entry(top, width=18)
+        ent_fee.grid(row=3, column=1, padx=(8, 10), pady=4, sticky="w")
+        ent_fee.insert(0, "0")
+
+        tk.Label(top, text="메모", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=3, column=2, sticky="w")
+        ent_memo = self._make_entry(top)
+        ent_memo.grid(row=3, column=3, padx=(8, 0), pady=4, sticky="ew")
+
+        mid = tk.Frame(win, bg=self.BG)
+        mid.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        mid.columnconfigure(0, weight=1)
+
+        txt = tk.Text(mid, bg=self.ENTRY_BG, fg=self.FG, font=(self.FONT_MAIN[0], 10), wrap=tk.WORD, padx=12, pady=10)
+        txt.grid(row=0, column=0, sticky="nsew")
+        sb = tk.Scrollbar(mid, command=txt.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        txt.configure(yscrollcommand=sb.set)
+
+        self._setup_text_tags(txt, title_size=14, title_color=self.ACCENT, body_size=11)
+
+        def refresh_ticker_choices(*_args):
+            acc = str(ent_acc.get()).strip() or "일반 계좌"
+            choices = self._portfolio_choices_for_account(acc)
+            ent_ticker["values"] = [f"{t} | {n} | 보유 {q:g}" for (t, n, q) in choices]
+            if choices:
+                ent_ticker.set(ent_ticker["values"][0])
+            else:
+                ent_ticker.set("")
+
+        def build_report_text():
+            records: List[SellRecord] = []
+            for raw in (self.sell_records or []):
+                try:
+                    records.append(SellRecord.from_json(raw))
+                except Exception:
+                    continue
+            lines = []
+            lines.append("🧾 실현손익 리포트\n")
+            lines.append("=" * 62 + "\n")
+            lines.append(f"기록 건수: {len(records)}\n\n")
+
+            if not records:
+                lines.append("아직 매도 기록이 없습니다.\n상단에서 종목을 선택하고 매도 기록을 추가하세요.\n")
+                return "".join(lines)
+
+            def _fmt_sum_table(title, period_key):
+                lines.append(f"[ {title} ]\n")
+                sums = summarize_realized_pnl(records, self.portfolio, period_key)
+                if not sums:
+                    lines.append("  (기록 없음)\n\n")
+                    return
+                for k, s in sums:
+                    pnl = s.get("pnl_krw", 0.0)
+                    sign = "+" if pnl > 0 else ""
+                    lines.append(
+                        f"  - {k}: 손익 {sign}{int(round(pnl)):,}원"
+                        f" | 매도 {int(round(s.get('proceeds_krw', 0.0))):,}원"
+                        f" | 원가 {int(round(s.get('cost_krw', 0.0))):,}원"
+                        f" | 수수료 {int(round(s.get('fee_krw', 0.0))):,}원\n"
+                    )
+                lines.append("\n")
+
+            _fmt_sum_table("일간", "일간")
+            _fmt_sum_table("주간", "주간")
+            _fmt_sum_table("월간", "월간")
+            _fmt_sum_table("연간", "연간")
+
+            lines.append("=" * 62 + "\n")
+            lines.append("[ 매도 기록 ]\n")
+            for r in sorted(records, key=lambda x: x.sell_date):
+                kind = "해외" if r.is_us else "국내"
+                ex = f", 매도환율 {r.sell_exchange_rate:,.2f}" if r.is_us and r.sell_exchange_rate else ""
+                fee = f", 수수료 {int(round(r.fee_krw)):,}원" if r.fee_krw else ""
+                memo = f" ({r.memo})" if r.memo else ""
+                lines.append(
+                    f"  - {r.sell_date} | [{r.account}] {r.name} ({r.ticker})"
+                    f" | {kind} | 수량 {r.qty:g} | 매도가 {r.sell_price:g}{('$' if r.is_us else '원')}{ex}{fee}{memo}\n"
+                )
+            return "".join(lines)
+
+        def refresh_report_view():
+            txt.config(state="normal")
+            txt.delete("1.0", tk.END)
+            txt.insert(tk.END, build_report_text())
+            txt.config(state="disabled")
+
+        def parse_selected_ticker():
+            raw = str(ent_ticker.get() or "").strip()
+            if not raw:
+                return None
+            # Format: "TICKER | NAME | 보유 Q"
+            t = raw.split("|", 1)[0].strip()
+            return t
+
+        def find_holding(account, ticker):
+            for item in self.portfolio:
+                acc = str(item.get("account", "")).strip() or "일반 계좌"
+                t = str(item.get("ticker", "")).strip().upper()
+                if acc == account and t == ticker:
+                    return item
+            return None
+
+        def on_add_sell():
+            try:
+                account = str(ent_acc.get()).strip() or "일반 계좌"
+                ticker = parse_selected_ticker()
+                if not ticker:
+                    messagebox.showwarning("입력 오류", "매도할 종목을 선택하세요.")
+                    return
+                ticker = str(ticker).strip().upper()
+                holding = find_holding(account, ticker)
+                if not holding:
+                    messagebox.showwarning("대상 없음", "해당 계좌/종목 보유 내역을 찾지 못했습니다.")
+                    return
+                name = str(holding.get("name", "")).strip() or ticker
+                is_us = not is_korean_ticker(ticker)
+
+                rec = SellRecord(
+                    sell_date=str(ent_date.get()).strip(),
+                    account=account,
+                    ticker=ticker,
+                    name=name,
+                    qty=float(str(ent_qty.get()).strip().replace(",", "")),
+                    sell_price=float(str(ent_price.get()).strip().replace(",", "")),
+                    is_us=is_us,
+                    sell_exchange_rate=(float(str(ent_sell_ex.get()).strip().replace(",", "")) if is_us else None),
+                    fee_krw=float(str(ent_fee.get()).strip().replace(",", "") or "0"),
+                    memo=str(ent_memo.get()).strip(),
+                ).normalized()
+
+                old_qty = float(holding.get("qty", 0) or 0)
+                if rec.qty > old_qty + 1e-12:
+                    messagebox.showwarning("수량 오류", f"매도 수량이 보유 수량을 초과합니다.\n보유: {old_qty:g} / 매도: {rec.qty:g}")
+                    return
+
+                self.sell_records.append(rec.to_json())
+                self._merge_and_persist_sell_records([])  # dedupe + persist
+                self.portfolio = apply_sell_to_portfolio(self.portfolio, rec)
+                self.listbox.insert(tk.END, f"[매도기록] [{account}] {name} ({ticker}) | {rec.qty:g}주")
+                self.refresh_account_options(preferred_account=account)
+                refresh_ticker_choices()
+                refresh_report_view()
+            except Exception as e:
+                messagebox.showerror("실현손익 기록 실패", f"매도 기록 추가 중 오류가 발생했습니다.\n\n{e}")
+
+        ent_acc.bind("<<ComboboxSelected>>", refresh_ticker_choices)
+        refresh_ticker_choices()
+
+        btn_row = tk.Frame(win, bg=self.BG)
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+        self._make_button(btn_row, "➕ 매도 기록 추가", on_add_sell, bg=self.ACCENT, fg="#0D1117", bold=True, pad=(12, 7)).pack(side="left")
+        self._make_button(btn_row, "🔄 리포트 새로고침", refresh_report_view, bg="#2E8B57", fg="white", bold=True, pad=(12, 7)).pack(side="left", padx=(8, 0))
+
+        refresh_report_view()
+
+    def get_exchange_rate(self):
+        try:
+            return float(yf.Ticker("KRW=X").history(period="1d")['Close'].iloc[-1])
+        except Exception:
+            return 1400.0
+
+    def get_kr_price(self, code):
+        try:
+            res = requests.get(
+                f"https://finance.naver.com/item/main.naver?code={code}",
+                headers={'User-Agent': 'Mozilla/5.0'},
+                timeout=5,
+            )
+            price_tag = BeautifulSoup(res.text, 'html.parser').select_one('.no_today .blind')
+            if price_tag:
+                return float(price_tag.text.replace(',', ''))
+        except Exception:
+            pass
+        return 0.0
+
+    def get_krx_gold_price_krw_per_g(self, reuters_code="M04020000", category="metals"):
+        """
+        네이버증권 모바일 내부 API(front-api)로 KRX 금(국내 금) 가격(원/g)을 가져온다.
+        - reutersCode: 기본 M04020000 (국내 금)
+        - category: 기본 metals
+        """
+        try:
+            url = "https://m.stock.naver.com/front-api/marketIndex/productDetail"
+            params = {"category": category, "reutersCode": reuters_code}
+            res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=5)
+            data = res.json()
+            if not isinstance(data, dict) or not data.get("isSuccess"):
+                return 0.0
+            result = data.get("result") or {}
+            close_price = str(result.get("closePrice", "")).replace(",", "").strip()
+            if not close_price:
+                return 0.0
+            return float(close_price)
+        except Exception:
+            return 0.0
+
+    def get_us_price(self, ticker):
+        try:
+            return float(yf.Ticker(ticker).fast_info['last_price'])
+        except Exception:
+            return 0.0
+
+    def update_rebalance_config_from_gui(self):
+        try:
+            self.target_ratios["주식"] = float(self.ent_ratio_stock.get().strip() or "0")
+            self.target_ratios["채권"] = float(self.ent_ratio_bond.get().strip() or "0")
+            self.target_ratios["금"] = float(self.ent_ratio_gold.get().strip() or "0")
+            self.target_ratios["원자재"] = float(self.ent_ratio_comm.get().strip() or "0")
+            self.target_ratios["현금성 자산"] = float(self.ent_ratio_cash.get().strip() or "0")
+        except ValueError:
+            messagebox.showwarning("입력 오류", "리밸런싱 비중은 숫자로 입력해주세요.")
+            raise
+
+    def _load_target_ratios_from_json(self, data):
+        def _to_float(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        alias_map = {
+            "주식": ["주식", "stock", "stocks", "equity", "equities", "ratio_stock", "stock_ratio"],
+            "채권": ["채권", "bond", "bonds", "fixed_income", "ratio_bond", "bond_ratio"],
+            "금": ["금", "gold", "ratio_gold", "gold_ratio"],
+            "원자재": ["원자재", "commodity", "commodities", "ratio_commodity", "commodity_ratio"],
+            "현금성 자산": ["현금성 자산", "현금", "cash", "cash_equivalent", "cash_equivalents", "ratio_cash", "cash_ratio"],
+        }
+
+        sources = []
+        if isinstance(data, dict):
+            sources.append(data)
+            for key in ["target_ratios", "rebalance_ratios", "rebalance_ratio"]:
+                v = data.get(key)
+                if isinstance(v, dict):
+                    sources.append(v)
+
+        loaded = {}
+        for category, aliases in alias_map.items():
+            for source in sources:
+                found = False
+                for alias in aliases:
+                    if alias in source:
+                        ratio_val = _to_float(source.get(alias))
+                        if ratio_val is not None:
+                            loaded[category] = ratio_val
+                            found = True
+                            break
+                if found:
+                    break
+        return loaded
+
+    def sync_rebalance_entries_from_config(self):
+        self.ent_ratio_stock.delete(0, tk.END)
+        self.ent_ratio_stock.insert(0, str(self.target_ratios.get("주식", 0)))
+        self.ent_ratio_bond.delete(0, tk.END)
+        self.ent_ratio_bond.insert(0, str(self.target_ratios.get("채권", 0)))
+        self.ent_ratio_gold.delete(0, tk.END)
+        self.ent_ratio_gold.insert(0, str(self.target_ratios.get("금", 0)))
+        self.ent_ratio_comm.delete(0, tk.END)
+        self.ent_ratio_comm.insert(0, str(self.target_ratios.get("원자재", 0)))
+        self.ent_ratio_cash.delete(0, tk.END)
+        self.ent_ratio_cash.insert(0, str(self.target_ratios.get("현금성 자산", 0)))
+
+    def validate_rebalance_ratio_sum(self):
+        ratio_sum = sum(float(v) for v in self.target_ratios.values())
+        if abs(ratio_sum - 100.0) > 1e-6:
+            messagebox.showwarning(
+                "리밸런싱 비중 오류",
+                f"리밸런싱 비중 합계는 반드시 100이어야 합니다.\n현재 합계: {ratio_sum:.4f}",
+            )
+            return False
+        return True
+
+    def get_rebalance_guide(self, total_val, macro_alloc):
+        ratio_sum = sum(v for v in self.target_ratios.values() if v > 0)
+        if ratio_sum <= 0:
+            return None, "리밸런싱 비중 합계가 0입니다. 비중을 다시 입력해주세요."
+        if abs(ratio_sum - 100.0) > 1e-6:
+            return None, f"리밸런싱 비중 합계는 100이어야 합니다. 현재 합계: {ratio_sum:.4f}"
+
+        guides = []
+        categories = ["주식", "채권", "금", "원자재", "현금성 자산"]
+        for cat in categories:
+            target_amount = total_val * (max(self.target_ratios.get(cat, 0), 0) / ratio_sum)
+            current_amount = macro_alloc.get(cat, 0.0)
+            diff = target_amount - current_amount
+            action = "매수" if diff > 0 else ("매도" if diff < 0 else "유지")
+            guides.append({"category": cat, "current": current_amount, "target": target_amount, "diff": diff, "action": action})
+
+        return guides, None
+
+    def save_and_get_history(self, total_roi, total_prin, total_val, macro_alloc):
+        filename = get_history_file_path()
+        history = {}
+        legacy_filename = "portfolio_history.json"
+
+        if os.path.exists(filename):
+            try:
+                with open(filename, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            except Exception:
+                pass
+        elif os.path.exists(legacy_filename):
+            # 기존 상대경로 파일이 있으면 최초 1회 자동 마이그레이션
+            try:
+                with open(legacy_filename, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            except Exception:
+                history = {}
+
+        alloc_record = {}
+        for cat, val in macro_alloc.items():
+            pct = round((val / total_val * 100), 2) if total_val > 0 else 0.0
+            alloc_record[cat] = {"amount": round(val, 2), "percent": pct}
+
+        today = datetime.date.today().strftime('%Y-%m-%d')
+        history[today] = {"roi": total_roi, "principal": total_prin, "value": total_val, "allocation": alloc_record}
+
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(history, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+
+        return dict(sorted(history.items()))
+
+    def calculate_and_draw(self, in_place_refresh=False):
+        try:
+            if not self.portfolio and not self.account_cash:
+                return
+            self.update_rebalance_config_from_gui()
+            if self.rebalance_enabled.get() and not self.validate_rebalance_ratio_sum():
+                self.lbl_status.config(text="리밸런싱 비중 합계 오류 - 계산 중단", fg="#FF6B6B")
+                return
+
+            self.lbl_status.config(text="실시간 시세 및 수익률 계산 중...", fg="#FFFF00")
+            self.root.update()
+
+            exchange_rate = self.get_exchange_rate()
+            asset_values = defaultdict(float)
+            report_data = []
+
+            macro_alloc = {"현금성 자산": 0.0, "주식": 0.0, "채권": 0.0, "금": 0.0, "원자재": 0.0}
+
+            pure_cash_val = 0.0
+            for ent in self.account_cash:
+                acc_name = str(ent.get("account", "")).strip() or "일반 계좌"
+                ck = float(ent.get("cash_krw", 0) or 0)
+                cu = float(ent.get("cash_usd", 0) or 0)
+                usd_val_krw = cu * exchange_rate
+                usd_cost_krw = float(ent.get("usd_cost_krw", 0) or 0)
+                if cu > 0 and usd_cost_krw <= 0:
+                    usd_cost_krw = usd_val_krw
+                line_prin = ck + usd_cost_krw
+                line_val = ck + usd_val_krw
+                if line_val <= 0:
+                    continue
+                pure_cash_val += line_val
+                asset_values["현금 및 현금성 자산"] += line_val
+                macro_alloc["현금성 자산"] += line_val
+                parts = []
+                if ck > 0:
+                    parts.append(f"KRW {ck:,.0f}")
+                if cu > 0:
+                    parts.append(f"USD {cu:,.2f}")
+                cash_label = "예수금 (" + " · ".join(parts) + ")" if parts else "예수금"
+                report_data.append(
+                    {
+                        'name': cash_label,
+                        'account': acc_name,
+                        'is_pure_cash': True,
+                        'is_usd_cash': cu > 0,
+                        'roi': ((line_val - line_prin) / line_prin * 100) if line_prin > 0 else 0.0,
+                        'prof': line_val - line_prin,
+                        'fx_prof': usd_val_krw - usd_cost_krw,
+                        'val': line_val,
+                        'prin': line_prin,
+                    }
+                )
+
+            total_prin = pure_cash_val
+            total_val = pure_cash_val
+
+            for item in self.portfolio:
+                name = item.get('name', '알수없음')
+                ticker = str(item.get('ticker', '')).strip()
+                acc_name = item.get('account', '일반 계좌')  # 명시된 계좌명 사용
+
+                # FIXED(실물/고정자산): prin/val 수동입력 대신 qty/avg_price 기반 자동 계산 지원
+                if ticker.upper() == "FIXED":
+                    qty = float(item.get("qty", 0) or 0)
+                    avg_price = float(item.get("avg_price", 0) or 0)  # 1개당 매입단가(원)
+                    p_krw = avg_price * qty
+                    v_krw = float(item.get("val", 0) or 0)  # fallback (legacy)
+
+                    # 연동 가격소스가 있으면 실시간 평가액을 재계산한다.
+                    if str(item.get("price_source", "")).strip().lower() == "naver_marketindex":
+                        cfg = item.get("naver_marketindex") or {}
+                        reuters_code = str(cfg.get("reutersCode", "")).strip() or "M04020000"
+                        category = str(cfg.get("category", "")).strip() or "metals"
+                        unit_price = str(cfg.get("unit_price", "")).strip().upper() or "KRW_PER_G"
+                        unit_weight_g = float(item.get("unit_weight_g", 1) or 1)
+                        if qty > 0 and unit_weight_g > 0 and unit_price == "KRW_PER_G":
+                            krw_per_g = self.get_krx_gold_price_krw_per_g(reuters_code=reuters_code, category=category)
+                            if krw_per_g > 0:
+                                v_krw = krw_per_g * unit_weight_g * qty
+                    else:
+                        if v_krw <= 0 and p_krw > 0:
+                            v_krw = p_krw
+
+                    roi = ((v_krw - p_krw) / p_krw * 100) if p_krw > 0 else 0
+                    report_data.append({'name': name, 'account': acc_name, 'is_fixed': True, 'roi': roi, 'prof': v_krw - p_krw, 'val': v_krw, 'prin': p_krw})
+
+                    cat = get_asset_category(name, "")
+                    asset_values[name] += v_krw
+                    macro_alloc[cat] += v_krw
+
+                    total_prin += p_krw
+                    total_val += v_krw
+                    continue
+
+                qty = float(item.get('qty', 0))
+                avg_price = float(item.get('avg_price', 0))
+
+                cat = get_asset_category(name, ticker)
+
+                if is_korean_ticker(ticker):
+                    cur_price = self.get_kr_price(ticker)
+                    v_krw = cur_price * qty
+                    p_krw = avg_price * qty
+                    roi = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 else 0
+                    report_data.append({'name': name, 'ticker': ticker, 'account': acc_name, 'is_us': False, 'qty': qty, 'roi': roi, 'prof': v_krw - p_krw, 'cur_p': cur_price, 'avg_p': avg_price, 'val': v_krw, 'prin': p_krw})
+                else:
+                    cur_price = self.get_us_price(ticker)
+                    v_usd = cur_price * qty
+                    p_usd = avg_price * qty
+                    buy_ex = float(item.get('buy_exchange_rate', exchange_rate) or exchange_rate)
+                    v_krw = v_usd * exchange_rate
+                    p_krw = p_usd * buy_ex
+                    roi = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 else 0
+                    price_prof = (cur_price - avg_price) * qty * buy_ex
+                    fx_prof = (exchange_rate - buy_ex) * v_usd
+                    report_data.append(
+                        {
+                            'name': name,
+                            'ticker': ticker,
+                            'account': acc_name,
+                            'is_us': True,
+                            'qty': qty,
+                            'roi': roi,
+                            'prof': v_krw - p_krw,
+                            'price_prof': price_prof,
+                            'fx_prof': fx_prof,
+                            'cur_p': cur_price,
+                            'avg_p': avg_price,
+                            'buy_exchange_rate': buy_ex,
+                            'val': v_krw,
+                            'prin': p_krw,
+                        }
+                    )
+
+                macro_alloc[cat] += v_krw
+
+                if cat == "현금성 자산":
+                    asset_values["현금 및 현금성 자산"] += v_krw
+                else:
+                    asset_values[name] += v_krw
+
+                total_prin += p_krw
+                total_val += v_krw
+
+            total_profit = total_val - total_prin
+            total_roi = (total_profit / total_prin * 100) if total_prin > 0 else 0
+
+            self.history_data = self.save_and_get_history(total_roi, total_prin, total_val, macro_alloc)
+
+            self.current_asset_values = asset_values
+            self.current_macro_alloc = macro_alloc
+            self.current_total_val = total_val
+            self.current_rebalance_guide = None
+            self.current_rebalance_error = None
+            if self.rebalance_enabled.get():
+                self.current_rebalance_guide, self.current_rebalance_error = self.get_rebalance_guide(total_val, macro_alloc)
+
+            self.current_report_data = report_data
+            self.current_exchange_rate = exchange_rate
+
+            self.lbl_status.config(text="계산 완료! 통합 수익률 확인", fg="#00FF00")
+            if in_place_refresh and self.chart_win and self.chart_win.winfo_exists():
+                self.refresh_chart_and_report(report_data, total_prin, total_val, total_profit, total_roi, exchange_rate)
+            else:
+                self.show_chart_and_report(report_data, total_prin, total_val, total_profit, total_roi, exchange_rate)
+
+        except Exception:
+            err_msg = traceback.format_exc()
+            messagebox.showerror("데이터 수집 에러", f"시세를 불러오는 중 오류가 발생했습니다.\n\n{err_msg}")
+            self.lbl_status.config(text="오류 발생 - 계산 중단", fg="#FF6B6B")
+
+    def show_chart_and_report(self, report_data, total_prin, total_val, total_prof, total_roi, ex_rate):
+        try:
+            if self.chart_win and self.chart_win.winfo_exists():
+                self._close_chart_window()
+
+            self.chart_win = tk.Toplevel(self.root)
+            self.chart_win.title("포트폴리오 수익률 보고서 및 추이")
+            self.chart_win.configure(bg=self.BG)
+            self.chart_win.protocol("WM_DELETE_WINDOW", self._close_chart_window)
+            self.chart_win.bind("<Escape>", lambda event: self._close_chart_window())
+            try:
+                self.chart_win.attributes('-alpha', self.current_alpha)
+                self.chart_win.after(100, lambda: self.chart_win.attributes('-alpha', self.current_alpha))
+            except Exception:
+                pass
+
+            left_frame = tk.Frame(self.chart_win, bg=self.BG, width=550)
+            left_frame.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+            right_frame = tk.Frame(self.chart_win, bg=self.CARD_BG)
+            right_frame.pack(side='right', fill='both', expand=True, padx=10, pady=10)
+
+            top_action_frame = tk.Frame(left_frame, bg=self.CARD_BG)
+            top_action_frame.pack(side='top', fill='x', pady=(10, 5))
+
+            self._make_button(top_action_frame, "🍩 종목별 비중", self.show_pie_popup, bg="#D4AF37", fg="black", bold=True).pack(
+                side='left', expand=True, fill='x', padx=2
+            )
+            self._make_button(top_action_frame, "🍰 자산군 비중", self.show_macro_pie_popup, bg="#8C52FF", fg="white", bold=True).pack(
+                side='left', expand=True, fill='x', padx=2
+            )
+            self._make_button(top_action_frame, "📈 투자자산 비중", self.show_investment_pie_popup, bg="#E84393", fg="white", bold=True).pack(
+                side='left', expand=True, fill='x', padx=2
+            )
+            self._make_button(top_action_frame, "🏦 계좌별 수익률", self.show_account_yield_popup, bg="#FF914D", fg="black", bold=True).pack(
+                side='left', expand=True, fill='x', padx=2
+            )
+            self._make_button(top_action_frame, "⚖ 리밸런싱 가이드", self.show_rebalance_popup, bg="#2E8B57", fg="white", bold=True).pack(
+                side='left', expand=True, fill='x', padx=2
+            )
+
+            btn_frame = tk.Frame(left_frame, bg=self.CARD_BG)
+            btn_frame.pack(side='top', fill='x', pady=5, padx=10)
+            self.btn_daily = self._make_button(btn_frame, "일간 수익률", lambda: self.update_line_chart("일간"), bg="#FFD700", fg="black", bold=True)
+            self.btn_daily.pack(side='left', expand=True, fill='x', padx=2)
+            self.btn_weekly = self._make_button(btn_frame, "주간 수익률", lambda: self.update_line_chart("주간"), bg="#3A5A7A", fg="white", bold=True)
+            self.btn_weekly.pack(side='left', expand=True, fill='x', padx=2)
+            self.btn_monthly = self._make_button(btn_frame, "월간 수익률", lambda: self.update_line_chart("월간"), bg="#3A5A7A", fg="white", bold=True)
+            self.btn_monthly.pack(side='left', expand=True, fill='x', padx=2)
+            self.btn_manual_refresh = self._make_button(
+                btn_frame,
+                "🔄 보고서 갱신",
+                self.refresh_report_on_click,
+                bg="#2E8B57",
+                fg="white",
+                bold=True
+            )
+            self.btn_manual_refresh.pack(side='left', expand=True, fill='x', padx=2)
+
+            line_frame = tk.Frame(left_frame, bg=self.BG)
+            line_frame.pack(side='bottom', fill='both', expand=True)
+
+            from matplotlib.figure import Figure
+            self.fig_line = Figure(figsize=(5, 6.8))
+            self.fig_line.patch.set_facecolor(self.BG)
+            self.canvas_line = FigureCanvasTkAgg(self.fig_line, master=line_frame)
+            self.canvas_line.get_tk_widget().pack(fill='both', expand=True)
+
+            self.generate_report_text(right_frame, report_data, total_prin, total_val, total_prof, total_roi, ex_rate)
+            self.chart_win.update_idletasks()
+            self._resize_and_place_chart_win(self.chart_win, desired_w=1100, desired_h=650, reserve_bottom=130)
+            self.update_line_chart("일간")
+            self.chart_win.update_idletasks()
+            self._resize_and_place_chart_win(self.chart_win, desired_w=1100, desired_h=650, reserve_bottom=130)
+
+        except Exception:
+            err_msg = traceback.format_exc()
+            messagebox.showerror("차트 UI 에러", f"보고서 화면을 띄우는 중 오류가 발생했습니다:\n\n{err_msg}")
+
+    def refresh_chart_and_report(self, report_data, total_prin, total_val, total_prof, total_roi, ex_rate):
+        if not (self.chart_win and self.chart_win.winfo_exists()):
+            return
+        if self.report_text_widget and self.report_text_widget.winfo_exists():
+            self._fill_report_text(self.report_text_widget, report_data, total_prin, total_val, total_prof, total_roi, ex_rate)
+        self.update_line_chart(getattr(self, "current_chart_view_mode", "일간"))
+
+    def show_account_yield_popup(self):
+        if not hasattr(self, 'current_report_data'):
+            return
+
+        acc_win = tk.Toplevel(self.root)
+        acc_win.title("계좌별 수익률 요약")
+        acc_win.geometry("500x600")
+        acc_win.configure(bg=self.BG)
+        self.bind_escape_to_close(acc_win)
+        try:
+            acc_win.attributes('-alpha', self.current_alpha)
+            acc_win.after(100, lambda: acc_win.attributes('-alpha', self.current_alpha))
+        except Exception:
+            pass
+
+        scrollbar = tk.Scrollbar(acc_win)
+        scrollbar.pack(side='right', fill='y')
+        txt = tk.Text(acc_win, bg=self.ENTRY_BG, fg=self.FG, font=(self.FONT_MAIN[0], 11), yscrollcommand=scrollbar.set)
+        txt.pack(side='left', fill='both', expand=True, padx=10, pady=10)
+        scrollbar.config(command=txt.yview)
+
+        self._setup_text_tags(txt, title_size=14, title_color=self.ACCENT, body_size=11)
+
+        txt.insert(tk.END, "🏦 계좌별 수익률 요약\n", "title")
+        txt.insert(tk.END, "=" * 40 + "\n\n")
+
+        account_groups = defaultdict(list)
+        for d in self.current_report_data:
+            acc = d.get('account', '일반 계좌')
+            account_groups[acc].append(d)
+
+        for acc_name, items in account_groups.items():
+            acc_prin = sum(i.get('prin', 0) for i in items)
+            acc_val = sum(i.get('val', 0) for i in items)
+            acc_prof = acc_val - acc_prin
+            acc_roi = (acc_prof / acc_prin * 100) if acc_prin > 0 else 0
+
+            acc_tag = "up" if acc_roi > 0 else ("down" if acc_roi < 0 else "flat")
+            acc_sign = "+" if acc_roi > 0 else ""
+
+            txt.insert(tk.END, f"▶ [{acc_name}]\n", "acc_title")
+            txt.insert(tk.END, f"  총 평가금: {int(acc_val):,}원 / 매수: {int(acc_prin):,}원\n")
+            txt.insert(tk.END, f"  계좌 수익률: ")
+            txt.insert(tk.END, f"{acc_sign}{acc_roi:.2f}% ({acc_sign}{int(acc_prof):,}원)\n", acc_tag)
+            txt.insert(tk.END, "-" * 40 + "\n")
+
+            for d in items:
+                item_tag = "up" if d['roi'] > 0 else ("down" if d['roi'] < 0 else "flat")
+                item_sign = "+" if d['roi'] > 0 else ""
+                txt.insert(tk.END, f"  • {d['name']} : {int(d['val']):,}원 ")
+                txt.insert(tk.END, f"({item_sign}{d['roi']:.2f}%)\n", item_tag)
+
+            txt.insert(tk.END, "\n")
+
+        txt.config(state='disabled')
+
+    def show_pie_popup(self):
+        pie_win = tk.Toplevel(self.root)
+        pie_win.title("개별 종목 원형 차트")
+        pie_win.geometry("550x550")
+        pie_win.configure(bg=self.BG)
+        self.bind_escape_to_close(pie_win)
+        try:
+            pie_win.attributes('-alpha', self.current_alpha)
+            pie_win.after(100, lambda: pie_win.attributes('-alpha', self.current_alpha))
+        except Exception:
+            pass
+
+        from matplotlib.figure import Figure
+        fig_pie = Figure(figsize=(5, 5))
+        fig_pie.patch.set_facecolor(self.BG)
+        ax_pie = fig_pie.add_subplot(111)
+        ax_pie.set_facecolor(self.BG)
+
+        labels, sizes = [], []
+        for name, value in sorted(self.current_asset_values.items(), key=lambda x: x[1], reverse=True):
+            if value > 0:
+                labels.append(name)
+                sizes.append(value)
+
+        total = sum(sizes)
+        display_labels = []
+        for i, s in enumerate(sizes):
+            pct = s / total * 100
+            display_labels.append(labels[i] if pct >= 5 else "")
+
+        wedges, texts, autotexts = ax_pie.pie(
+            sizes,
+            labels=display_labels,
+            autopct=lambda p: f'{p:.1f}%' if p >= 5 else '',
+            startangle=90,
+            wedgeprops={'edgecolor': 'black', 'linewidth': 1},
+        )
+        for t in texts + autotexts:
+            t.set_color('white')
+            t.set_fontsize(9)
+
+        ax_pie.set_title("개별 종목별 비중 (호버: 요약 · 클릭: 구성)", color="white", fontsize=13, fontweight='bold', pad=15)
+
+        canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_win)
+        canvas_pie.draw()
+        canvas_pie.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
+
+        def on_stock_wedge_click(i):
+            body = self._format_stock_pie_slice_breakdown(labels[i], sizes[i])
+            self._show_pie_detail_popup(pie_win, f"{labels[i]} — 구성", body)
+
+        self._setup_pie_hover(canvas_pie, fig_pie, ax_pie, wedges, labels, sizes, parent_win=pie_win, on_wedge_click=on_stock_wedge_click)
+
+    def show_macro_pie_popup(self):
+        pie_win = tk.Toplevel(self.root)
+        pie_win.title("자산군별 포트폴리오 비중")
+        pie_win.geometry("500x500")
+        pie_win.configure(bg=self.BG)
+        self.bind_escape_to_close(pie_win)
+        try:
+            pie_win.attributes('-alpha', self.current_alpha)
+            pie_win.after(100, lambda: pie_win.attributes('-alpha', self.current_alpha))
+        except Exception:
+            pass
+
+        from matplotlib.figure import Figure
+        fig_pie = Figure(figsize=(5, 5))
+        fig_pie.patch.set_facecolor(self.BG)
+        ax_pie = fig_pie.add_subplot(111)
+        ax_pie.set_facecolor(self.BG)
+
+        labels, sizes, colors = [], [], []
+        color_map = {
+            "주식": "#FF6B6B",
+            "채권": "#4D96FF",
+            "현금성 자산": "#4CAF50",
+            "금": "#FFD700",
+            "원자재": "#B08D57",
+        }
+
+        for name, value in sorted(self.current_macro_alloc.items(), key=lambda x: x[1], reverse=True):
+            if value > 0:
+                labels.append(name)
+                sizes.append(value)
+                colors.append(color_map.get(name, "#FFFFFF"))
+
+        wedges, texts, autotexts = ax_pie.pie(
+            sizes,
+            labels=labels,
+            colors=colors,
+            autopct='%1.1f%%',
+            startangle=90,
+            wedgeprops={'edgecolor': 'black', 'linewidth': 1.5},
+        )
+        for t in texts + autotexts:
+            t.set_color('white')
+            t.set_fontsize(11)
+            t.set_fontweight('bold')
+
+        ax_pie.set_title("안전/위험 자산 배분 현황 (호버: 요약 · 클릭: 종목 구성)", color="white", fontsize=14, fontweight='bold', pad=15)
+
+        canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_win)
+        canvas_pie.draw()
+        canvas_pie.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
+
+        def on_macro_wedge_click(i):
+            body = self._format_macro_category_breakdown(labels[i])
+            self._show_pie_detail_popup(pie_win, f"{labels[i]} — 포함 종목", body)
+
+        self._setup_pie_hover(canvas_pie, fig_pie, ax_pie, wedges, labels, sizes, parent_win=pie_win, on_wedge_click=on_macro_wedge_click)
+
+    def show_investment_pie_popup(self):
+        pie_win = tk.Toplevel(self.root)
+        pie_win.title("투자자산 비중 (현금 제외)")
+        pie_win.geometry("500x500")
+        pie_win.configure(bg=self.BG)
+        self.bind_escape_to_close(pie_win)
+        try:
+            pie_win.attributes('-alpha', self.current_alpha)
+            pie_win.after(100, lambda: pie_win.attributes('-alpha', self.current_alpha))
+        except Exception:
+            pass
+
+        from matplotlib.figure import Figure
+        fig_pie = Figure(figsize=(5, 5))
+        fig_pie.patch.set_facecolor(self.BG)
+        ax_pie = fig_pie.add_subplot(111)
+        ax_pie.set_facecolor(self.BG)
+
+        labels, sizes, colors = [], [], []
+        color_map = {"주식": "#FF6B6B", "채권": "#4D96FF", "금": "#FFD700", "원자재": "#B08D57"}
+
+        invest_alloc = {k: v for k, v in self.current_macro_alloc.items() if k != "현금성 자산" and v > 0}
+
+        if not invest_alloc:
+            ax_pie.text(
+                0.5,
+                0.5,
+                "현금성 자산 외 투자자산이 없습니다.",
+                color="white",
+                ha="center",
+                va="center",
+                transform=ax_pie.transAxes,
+                fontsize=13,
+            )
+        else:
+            for name, value in sorted(invest_alloc.items(), key=lambda x: x[1], reverse=True):
+                labels.append(name)
+                sizes.append(value)
+                colors.append(color_map.get(name, "#FFFFFF"))
+
+            invest_total = sum(sizes)
+
+            def make_label(pct):
+                val = int(round(pct / 100.0 * invest_total))
+                return f"{pct:.1f}%\n({val:,}원)"
+
+            wedges, texts, autotexts = ax_pie.pie(
+                sizes,
+                labels=labels,
+                colors=colors,
+                autopct='%1.1f%%',
+                startangle=90,
+                wedgeprops={'edgecolor': 'black', 'linewidth': 1.5},
+            )
+            for t in texts + autotexts:
+                t.set_color('white')
+                t.set_fontsize(10)
+                t.set_fontweight('bold')
+
+        ax_pie.set_title("투자자산 비중 - 현금 제외 (호버: 요약 · 클릭: 종목 구성)", color="white", fontsize=14, fontweight='bold', pad=15)
+
+        canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_win)
+        canvas_pie.draw()
+        canvas_pie.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
+        if invest_alloc:
+
+            def on_invest_wedge_click(i):
+                body = self._format_macro_category_breakdown(labels[i])
+                self._show_pie_detail_popup(pie_win, f"{labels[i]} — 포함 종목", body)
+
+            self._setup_pie_hover(canvas_pie, fig_pie, ax_pie, wedges, labels, sizes, parent_win=pie_win, on_wedge_click=on_invest_wedge_click)
+
+    def show_rebalance_popup(self):
+        if not self.rebalance_enabled.get():
+            messagebox.showinfo("리밸런싱 OFF", "리밸런싱 가이드가 OFF 상태입니다.\n메인 화면에서 ON 후 다시 계산해주세요.")
+            return
+
+        rb_win = tk.Toplevel(self.root)
+        rb_win.title("자산군 리밸런싱 가이드")
+        rb_win.geometry("620x560")
+        rb_win.configure(bg=self.BG)
+        self.bind_escape_to_close(rb_win)
+        try:
+            rb_win.attributes('-alpha', self.current_alpha)
+            rb_win.after(100, lambda: rb_win.attributes('-alpha', self.current_alpha))
+        except Exception:
+            pass
+
+        scrollbar = tk.Scrollbar(rb_win)
+        scrollbar.pack(side='right', fill='y')
+        txt = tk.Text(rb_win, bg=self.ENTRY_BG, fg=self.FG, font=(self.FONT_MAIN[0], 11), yscrollcommand=scrollbar.set)
+        txt.pack(side='left', fill='both', expand=True, padx=10, pady=10)
+        scrollbar.config(command=txt.yview)
+
+        self._setup_text_tags(txt, title_size=14, title_color=self.ACCENT, body_size=11)
+
+        txt.insert(tk.END, "⚖ 자산군 리밸런싱 가이드\n", "title")
+        txt.insert(tk.END, "=" * 46 + "\n")
+        txt.insert(
+            tk.END,
+            f"목표 비중(주식:채권:금:원자재:현금) = "
+            f"{self.target_ratios['주식']}:{self.target_ratios['채권']}:{self.target_ratios['금']}:{self.target_ratios['원자재']}:{self.target_ratios['현금성 자산']}\n",
+        )
+        txt.insert(tk.END, f"기준 총자산: {int(getattr(self, 'current_total_val', 0)):,}원\n\n")
+
+        if getattr(self, "current_rebalance_error", None):
+            txt.insert(tk.END, f"⚠ {self.current_rebalance_error}\n", "down")
+        else:
+            guide_list = getattr(self, "current_rebalance_guide", None) or []
+            if not guide_list:
+                txt.insert(
+                    tk.END,
+                    "계산된 리밸런싱 데이터가 없습니다.\n'계산 및 차트/수익률 보기'를 먼저 실행해주세요.\n",
+                    "flat",
+                )
+            else:
+                total_val = float(getattr(self, "current_total_val", 0.0))
+                for g in guide_list:
+                    cur_pct = (g["current"] / total_val * 100) if total_val > 0 else 0.0
+                    target_pct = (g["target"] / total_val * 100) if total_val > 0 else 0.0
+                    txt.insert(
+                        tk.END,
+                        f"▶ {g['category']} | 현재 {cur_pct:.2f}% ({int(g['current']):,}원) → 목표 {target_pct:.2f}% ({int(g['target']):,}원)\n",
+                    )
+                    if g["action"] == "매수":
+                        txt.insert(tk.END, f"  - 권장: {int(abs(g['diff'])):,}원 매수\n", "up")
+                    elif g["action"] == "매도":
+                        txt.insert(tk.END, f"  - 권장: {int(abs(g['diff'])):,}원 매도\n", "down")
+                    else:
+                        txt.insert(tk.END, "  - 권장: 유지 (목표 비중과 동일)\n", "flat")
+
+        txt.config(state='disabled')
+
+    def update_line_chart(self, view_mode):
+        if not hasattr(self, 'history_data') or not self.history_data:
+            return
+        self.current_chart_view_mode = view_mode
+
+        if hasattr(self, "canvas_line"):
+            self._disconnect_line_chart_hovers()
+
+        if hasattr(self, 'btn_daily') and hasattr(self, 'btn_weekly') and hasattr(self, 'btn_monthly'):
+            active_bg, active_fg = ("#FFD700", "black")
+            idle_bg, idle_fg = ("#3A5A7A", "white")
+            self.btn_daily.config(bg=active_bg if view_mode == "일간" else idle_bg, fg=active_fg if view_mode == "일간" else idle_fg)
+            self.btn_weekly.config(bg=active_bg if view_mode == "주간" else idle_bg, fg=active_fg if view_mode == "주간" else idle_fg)
+            self.btn_monthly.config(bg=active_bg if view_mode == "월간" else idle_bg, fg=active_fg if view_mode == "월간" else idle_fg)
+
+        df = pd.DataFrame.from_dict(self.history_data, orient='index')
+        if 'roi' not in df.columns:
+            if 0 in df.columns:
+                df['roi'] = df[0]
+            else:
+                df['roi'] = 0.0
+        if 'principal' not in df.columns:
+            df['principal'] = np.nan
+        if 'value' not in df.columns:
+            df['value'] = np.nan
+
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+
+        if not df.empty:
+            _hset = _kr_holiday_date_set(df.index.min(), df.index.max())
+            df = df.loc[df.index.map(lambda t: _is_kr_business_day(t, _hset))]
+
+        if view_mode == "주간":
+            df = df.groupby(df.index.to_period('W-FRI')).last()
+            df.index = df.index.to_timestamp()
+        if view_mode == "월간":
+            df = df.groupby(df.index.to_period('M')).last()
+            df.index = df.index.to_timestamp()
+
+        self.fig_line.clf()
+        mode_label = view_mode if view_mode in ("일간", "주간", "월간") else "일간"
+
+        if not df.empty:
+            dates = df.index
+            rois = df['roi']
+            prins = df['principal'].ffill().bfill().fillna(0)
+            vals = df['value'].ffill().bfill().fillna(0)
+
+            prev_vals = vals.shift(1)
+            net_flow = prins.diff().fillna(0.0)
+            pure_day_returns = ((vals - prev_vals - net_flow) / prev_vals.replace(0, np.nan)) * 100.0
+            if not pure_day_returns.empty:
+                pure_day_returns.iloc[0] = 0.0
+            pure_day_returns = pure_day_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+            ax_roi = self.fig_line.add_subplot(311)
+            ax_roi.set_facecolor(self.BG)
+            roi_colors = ["#FF6B6B" if r >= 0 else "#4D96FF" for r in rois]
+            ax_roi.plot(dates, rois, color="#00FFFF", linewidth=2, marker='o', markersize=6)
+            ax_roi.scatter(dates, rois, color=roi_colors, s=50, zorder=5)
+            for d, r in zip(dates, rois):
+                sign = "+" if r >= 0 else ""
+                ax_roi.annotate(f"{sign}{r:.2f}%", (d, r), textcoords="offset points", xytext=(0, 10), ha='center', color='white', fontsize=8, fontweight='bold')
+            ax_roi.axhline(0, color='white', linestyle=':', linewidth=1, alpha=0.5)
+            ax_roi.set_ylabel("수익률 (%)", color="white")
+            ax_roi.set_title(f"투자원금 대비 수익률 ({mode_label})", color="white", fontsize=12, fontweight='bold', pad=10)
+            ax_roi.tick_params(axis='y', colors='white', labelsize=9)
+            ax_roi.tick_params(axis='x', colors='white', labelsize=8)
+            ax_roi.grid(True, linestyle=':', alpha=0.2)
+
+            ax_pure_day = self.fig_line.add_subplot(312)
+            ax_pure_day.set_facecolor(self.BG)
+            pure_day_colors = ["#FF6B6B" if r >= 0 else "#4D96FF" for r in pure_day_returns]
+            ax_pure_day.plot(dates, pure_day_returns, color="#FFA657", linewidth=2, marker='o', markersize=5)
+            ax_pure_day.scatter(dates, pure_day_returns, color=pure_day_colors, s=42, zorder=5)
+            for d, r in zip(dates, pure_day_returns):
+                sign = "+" if r >= 0 else ""
+                ax_pure_day.annotate(f"{sign}{r:.2f}%", (d, r), textcoords="offset points", xytext=(0, 10), ha='center', color='white', fontsize=8, fontweight='bold')
+            ax_pure_day.axhline(0, color='white', linestyle=':', linewidth=1, alpha=0.5)
+            pure_day_mode_label = "전일" if view_mode == "일간" else ("전주" if view_mode == "주간" else "전월")
+            ax_pure_day.set_ylabel("입출금 제외 (%)", color="white")
+            ax_pure_day.set_title(f"{pure_day_mode_label} 순수 성과 추이 ({mode_label})", color="white", fontsize=12, fontweight='bold', pad=10)
+            ax_pure_day.tick_params(axis='y', colors='white', labelsize=9)
+            ax_pure_day.tick_params(axis='x', colors='white', labelsize=8)
+            ax_pure_day.grid(True, linestyle=':', alpha=0.2)
+
+            def _roi_tip(i):
+                r = float(rois.iloc[i])
+                sign = "+" if r >= 0 else ""
+                return f"{_date_with_weekday_kr(dates[i])}\n원금 대비 수익률: {sign}{r:.2f}%"
+
+            def _pure_tip(i):
+                r = float(pure_day_returns.iloc[i])
+                sign = "+" if r >= 0 else ""
+                lbl = "전일 순수 성과" if view_mode == "일간" else ("전주 순수 성과" if view_mode == "주간" else "전월 순수 성과")
+                return f"{_date_with_weekday_kr(dates[i])}\n{lbl}: {sign}{r:.2f}%"
+
+            self._setup_line_series_hover(ax_roi, dates, rois.values, _roi_tip)
+            self._setup_line_series_hover(ax_pure_day, dates, pure_day_returns.values, _pure_tip)
+
+            ax_val = self.fig_line.add_subplot(313)
+            ax_val.set_facecolor(self.BG)
+            ax_val.plot(dates, prins, color="#AAAAAA", linestyle='--', linewidth=2, marker='s', markersize=4, label="투자 원금")
+            ax_val.plot(dates, vals, color="#FFD700", linewidth=2.5, marker='o', markersize=5, label="현재 평가금")
+            ax_val.fill_between(dates, prins, vals, where=(vals >= prins), color="#FF6B6B", alpha=0.15, interpolate=True)
+            ax_val.fill_between(dates, prins, vals, where=(vals < prins), color="#4D96FF", alpha=0.15, interpolate=True)
+            ax_val.set_ylabel("자산 규모 (원)", color="white")
+            ax_val.set_title(f"투자 원금 vs 평가금 ({mode_label})", color="white", fontsize=12, fontweight='bold', pad=10)
+            ax_val.tick_params(axis='y', colors='white', labelsize=9)
+            ax_val.tick_params(axis='x', colors='white', labelsize=8)
+            ax_val.yaxis.set_major_formatter(FuncFormatter(currency_formatter))
+            ax_val.legend(loc='upper left', facecolor=self.BG, edgecolor='white', labelcolor='white', fontsize=9)
+            ax_val.grid(True, linestyle=':', alpha=0.2)
+
+            self._setup_line_chart_val_hover(ax_val, dates, prins, vals)
+
+            self.fig_line.autofmt_xdate()
+            self.fig_line.subplots_adjust(hspace=0.55)
+        else:
+            ax = self.fig_line.add_subplot(111)
+            ax.set_facecolor(self.BG)
+            ax.text(0.5, 0.5, "해당 기간의 기록이 없습니다.", color="white", ha="center", va="center", transform=ax.transAxes)
+
+        self.canvas_line.draw()
+
+    def generate_report_text(self, right_frame, report_data, total_prin, total_val, total_prof, total_roi, ex_rate):
+        scrollbar = tk.Scrollbar(right_frame)
+        scrollbar.pack(side='right', fill='y')
+        txt = tk.Text(right_frame, bg=self.ENTRY_BG, fg=self.FG, font=(self.FONT_MAIN[0], 11), yscrollcommand=scrollbar.set)
+        txt.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+        scrollbar.config(command=txt.yview)
+        self.report_text_widget = txt
+
+        self._setup_text_tags(txt, title_size=14, title_color=self.ACCENT, body_size=11)
+        self._fill_report_text(txt, report_data, total_prin, total_val, total_prof, total_roi, ex_rate)
+
+    def _fill_report_text(self, txt, report_data, total_prin, total_val, total_prof, total_roi, ex_rate):
+        txt.config(state='normal')
+        txt.delete("1.0", tk.END)
+        txt.insert(tk.END, "📊 포트폴리오 수익률 상세 보고서\n", "title")
+        txt.insert(tk.END, "=" * 45 + "\n")
+        txt.insert(tk.END, f"적용 환율: 1 USD = {ex_rate:,.2f} KRW\n\n")
+
+        txt.insert(tk.END, "[ 개별 종목 수익률 ]\n")
+        for d in report_data:
+            tag = "up" if d['roi'] > 0 else ("down" if d['roi'] < 0 else "flat")
+            sign = "+" if d['roi'] > 0 else ""
+
+            if d.get('is_pure_cash'):
+                txt.insert(tk.END, f"▶ {d['name']} [{d['account']}]\n")
+                cash_tag = "up" if d['roi'] > 0 else ("down" if d['roi'] < 0 else "flat")
+                cash_sign = "+" if d['roi'] > 0 else ""
+                txt.insert(tk.END, f"  - 예수금(원화 환산 평가): {int(d['val']):,}원 / 원가: {int(d['prin']):,}원 (")
+                txt.insert(tk.END, f"{cash_sign}{d['roi']:.2f}%\n", cash_tag)
+                txt.insert(tk.END, "  - 손익금: ")
+                txt.insert(tk.END, f"{cash_sign}{int(d['prof']):,}원\n", cash_tag)
+                if d.get('is_usd_cash'):
+                    fx_prof = float(d.get('fx_prof', 0.0))
+                    fx_tag = "up" if fx_prof > 0 else ("down" if fx_prof < 0 else "flat")
+                    fx_sign = "+" if fx_prof > 0 else ""
+                    txt.insert(tk.END, "  - 환손익: ")
+                    txt.insert(tk.END, f"{fx_sign}{int(fx_prof):,}원\n", fx_tag)
+                txt.insert(tk.END, "\n")
+            elif d.get('is_fixed'):
+                txt.insert(tk.END, f"▶ {d['name']} [{d['account']}]\n")
+                txt.insert(tk.END, f"  - 총 평가액: {int(d['val']):,}원 / 매수액: {int(d['prin']):,}원 (")
+                txt.insert(tk.END, f"{sign}{d['roi']:.2f}%\n", tag)
+                txt.insert(tk.END, "  - 손익금: ")
+                txt.insert(tk.END, f"{sign}{int(d['prof']):,}원\n\n", tag)
+            else:
+                unit = "$" if d.get('is_us') else "원"
+                qty = d.get('qty')
+                txt.insert(tk.END, f"▶ {d['name']} [{d['account']}]\n")
+                if qty is not None:
+                    txt.insert(tk.END, f"  - 보유 수량: {qty:,.4f}\n")
+                txt.insert(tk.END, f"  - 평단 {d['avg_p']:,.2f}{unit} → 현재 {d['cur_p']:,.2f}{unit} (")
+                txt.insert(tk.END, f"{sign}{d['roi']:.2f}%\n", tag)
+                txt.insert(tk.END, f"  - 평가액: {int(d['val']):,}원 / 매수액: {int(d['prin']):,}원\n")
+                txt.insert(tk.END, "  - 손익금: ")
+                txt.insert(tk.END, f"{sign}{int(d['prof']):,}원\n\n", tag)
+                if d.get('is_us'):
+                    buy_ex = float(d.get('buy_exchange_rate', ex_rate))
+                    txt.insert(tk.END, f"  - 매수 기준 환율: 1 USD = {buy_ex:,.2f} KRW\n")
+                    price_prof = float(d.get('price_prof', 0.0))
+                    fx_prof = float(d.get('fx_prof', 0.0))
+                    price_tag = "up" if price_prof > 0 else ("down" if price_prof < 0 else "flat")
+                    fx_tag = "up" if fx_prof > 0 else ("down" if fx_prof < 0 else "flat")
+                    price_sign = "+" if price_prof > 0 else ""
+                    fx_sign = "+" if fx_prof > 0 else ""
+                    txt.insert(tk.END, "  - 가격손익: ")
+                    txt.insert(tk.END, f"{price_sign}{int(price_prof):,}원\n", price_tag)
+                    txt.insert(tk.END, "  - 환손익: ")
+                    txt.insert(tk.END, f"{fx_sign}{int(fx_prof):,}원\n\n", fx_tag)
+
+        txt.insert(tk.END, "=" * 45 + "\n")
+        txt.insert(tk.END, "[ 전체 포트폴리오 요약 ]\n", "title")
+        txt.insert(tk.END, f"▶ 총 매수 금액 : {int(total_prin):,}원\n")
+        txt.insert(tk.END, f"▶ 총 평가 금액 : {int(total_val):,}원\n")
+
+        total_tag = "up" if total_roi > 0 else ("down" if total_roi < 0 else "flat")
+        total_sign = "+" if total_roi > 0 else ""
+
+        txt.insert(tk.END, "▶ 통합 손익금 : ")
+        txt.insert(tk.END, f"{total_sign}{int(total_prof):,}원\n", total_tag)
+        txt.insert(tk.END, "▶ 통합 수익률 : ")
+        txt.insert(tk.END, f"{total_sign}{total_roi:.2f}%\n", total_tag)
+
+        if self.rebalance_enabled.get():
+            txt.insert(tk.END, "\n" + "=" * 45 + "\n")
+            txt.insert(tk.END, "[ 자산군 리밸런싱 가이드 ]\n", "title")
+            txt.insert(tk.END, "목표 비중(주식:채권:금:원자재:현금) = ")
+            txt.insert(
+                tk.END,
+                f"{self.target_ratios['주식']}:{self.target_ratios['채권']}:{self.target_ratios['금']}:{self.target_ratios['원자재']}:{self.target_ratios['현금성 자산']}\n",
+            )
+            txt.insert(tk.END, f"기준 총자산: {int(total_val):,}원\n\n")
+
+            if getattr(self, "current_rebalance_error", None):
+                txt.insert(tk.END, f"⚠ {self.current_rebalance_error}\n", "down")
+            else:
+                for g in (self.current_rebalance_guide or []):
+                    diff_sign = "+" if g["diff"] > 0 else ""
+                    cur_pct = (g["current"] / total_val * 100) if total_val > 0 else 0.0
+                    target_pct = (g["target"] / total_val * 100) if total_val > 0 else 0.0
+                    txt.insert(
+                        tk.END,
+                        f"▶ {g['category']} | 현재 {cur_pct:.2f}% ({int(g['current']):,}원) → 목표 {target_pct:.2f}% ({int(g['target']):,}원)\n",
+                    )
+                    if g["action"] == "매수":
+                        txt.insert(tk.END, f"  - 권장: {int(abs(g['diff'])):,}원 매수 ({diff_sign}{int(g['diff']):,}원)\n", "up")
+                    elif g["action"] == "매도":
+                        txt.insert(tk.END, f"  - 권장: {int(abs(g['diff'])):,}원 매도 ({int(g['diff']):,}원)\n", "down")
+                    else:
+                        txt.insert(tk.END, "  - 권장: 유지 (목표 비중과 동일)\n", "flat")
+
+            txt.see(tk.END)
+
+        txt.config(state='disabled')
+
+
+def run() -> None:
+    root = tk.Tk()
+    _app = PortfolioApp(root)
+
+    def signal_handler(sig, frame):
+        root.quit()
+        root.destroy()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    def check_signals():
+        root.after(500, check_signals)
+
+    check_signals()
+    root.mainloop()
+
+
+
