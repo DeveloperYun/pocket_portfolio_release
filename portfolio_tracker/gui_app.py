@@ -2742,6 +2742,32 @@ class PortfolioApp:
         self._setup_text_tags(txt, title_size=14, title_color=self.ACCENT, body_size=11)
         self._fill_report_text(txt, report_data, total_prin, total_val, total_prof, total_roi, ex_rate)
 
+    def _macro_category_pnl_rows(self, report_data):
+        """개별 보고서 행을 자산군으로 묶어 투자·평가·손익·수익률을 합산한다."""
+        sums: defaultdict[str, dict[str, float]] = defaultdict(lambda: {"prin": 0.0, "val": 0.0})
+        for d in report_data:
+            if d.get("is_pure_cash"):
+                cat = "현금성 자산"
+            elif d.get("is_fixed"):
+                cat = get_asset_category(d.get("name", ""), "")
+            else:
+                cat = get_asset_category(d.get("name", ""), d.get("ticker", ""))
+            sums[cat]["prin"] += float(d.get("prin", 0) or 0)
+            sums[cat]["val"] += float(d.get("val", 0) or 0)
+        order = ("주식", "채권", "금", "원자재", "현금성 자산")
+        rows: list[dict] = []
+        for cat in order:
+            if cat not in sums:
+                continue
+            prin = sums[cat]["prin"]
+            val = sums[cat]["val"]
+            if prin <= 0 and val <= 0:
+                continue
+            prof = val - prin
+            roi = (prof / prin * 100.0) if prin > 0 else 0.0
+            rows.append({"category": cat, "prin": prin, "val": val, "prof": prof, "roi": roi})
+        return rows
+
     def _fill_report_text(self, txt, report_data, total_prin, total_val, total_prof, total_roi, ex_rate):
         txt.config(state='normal')
         txt.delete("1.0", tk.END)
@@ -2804,6 +2830,24 @@ class PortfolioApp:
         txt.insert(tk.END, "[ 전체 포트폴리오 요약 ]\n", "title")
         txt.insert(tk.END, f"▶ 총 매수 금액 : {int(total_prin):,}원\n")
         txt.insert(tk.END, f"▶ 총 평가 금액 : {int(total_val):,}원\n")
+
+        macro_rows = self._macro_category_pnl_rows(report_data)
+        if macro_rows:
+            txt.insert(tk.END, "\n")
+            txt.insert(tk.END, "  ― 자산군별 ―\n", "title")
+            for row in macro_rows:
+                tag = "up" if row["roi"] > 0 else ("down" if row["roi"] < 0 else "flat")
+                sign = "+" if row["roi"] > 0 else ""
+                prof_sign = "+" if row["prof"] > 0 else ""
+                txt.insert(tk.END, f"  ▶ {row['category']}\n")
+                txt.insert(
+                    tk.END,
+                    f"     투자(매수) {int(row['prin']):,}원  ·  평가 {int(row['val']):,}원  ·  수익률 ",
+                )
+                txt.insert(tk.END, f"{sign}{row['roi']:.2f}%\n", tag)
+                txt.insert(tk.END, "     손익 ")
+                txt.insert(tk.END, f"{prof_sign}{int(row['prof']):,}원\n", tag)
+            txt.insert(tk.END, "\n")
 
         total_tag = "up" if total_roi > 0 else ("down" if total_roi < 0 else "flat")
         total_sign = "+" if total_roi > 0 else ""
