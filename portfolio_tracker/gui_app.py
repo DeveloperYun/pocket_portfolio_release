@@ -32,6 +32,7 @@ from portfolio_tracker.utils import (
     is_kr_business_day as _is_kr_business_day,
     is_korean_ticker,
     kr_holiday_date_set as _kr_holiday_date_set,
+    count_kr_business_days_after_prev as _count_kr_bdays_after_prev,
     normalize_account_cash_entry as _normalize_account_cash_entry,
 )
 
@@ -2015,6 +2016,7 @@ class PortfolioApp:
             macro_alloc = {"현금성 자산": 0.0, "주식": 0.0, "채권": 0.0, "금": 0.0, "원자재": 0.0}
 
             pure_cash_val = 0.0
+            pure_cash_prin = 0.0
             for ent in self.account_cash:
                 acc_name = str(ent.get("account", "")).strip() or "일반 계좌"
                 ck = float(ent.get("cash_krw", 0) or 0)
@@ -2028,6 +2030,7 @@ class PortfolioApp:
                 if line_val <= 0:
                     continue
                 pure_cash_val += line_val
+                pure_cash_prin += line_prin
                 asset_values["현금 및 현금성 자산"] += line_val
                 macro_alloc["현금성 자산"] += line_val
                 parts = []
@@ -2050,7 +2053,7 @@ class PortfolioApp:
                     }
                 )
 
-            total_prin = pure_cash_val
+            total_prin = pure_cash_prin
             total_val = pure_cash_val
 
             for item in self.portfolio:
@@ -2290,19 +2293,32 @@ class PortfolioApp:
             acc_prof = acc_val - acc_prin
             acc_roi = (acc_prof / acc_prin * 100) if acc_prin > 0 else 0
 
+            sec_items = [i for i in items if not i.get('is_pure_cash')]
+            cash_items = [i for i in items if i.get('is_pure_cash')]
+            sec_prin = sum(i.get('prin', 0) for i in sec_items)
+            cash_prin = sum(i.get('prin', 0) for i in cash_items)
+
             acc_tag = "up" if acc_roi > 0 else ("down" if acc_roi < 0 else "flat")
             acc_sign = "+" if acc_roi > 0 else ""
 
             txt.insert(tk.END, f"▶ [{acc_name}]\n", "acc_title")
-            txt.insert(tk.END, f"  총 평가금: {int(acc_val):,}원 / 매수: {int(acc_prin):,}원\n")
-            txt.insert(tk.END, f"  계좌 수익률: ")
+            txt.insert(tk.END, f"  총 평가금: {int(acc_val):,}원\n")
+            if cash_items:
+                txt.insert(tk.END, f"  종목 매수(원가): {int(sec_prin):,}원  ·  예수금 원가: {int(cash_prin):,}원\n")
+                txt.insert(tk.END, f"  계좌 수익률 (종목+예수금 총원가 대비): ")
+            else:
+                txt.insert(tk.END, f"  매수(원가): {int(acc_prin):,}원\n")
+                txt.insert(tk.END, f"  계좌 수익률: ")
             txt.insert(tk.END, f"{acc_sign}{acc_roi:.2f}% ({acc_sign}{int(acc_prof):,}원)\n", acc_tag)
             txt.insert(tk.END, "-" * 40 + "\n")
 
             for d in items:
                 item_tag = "up" if d['roi'] > 0 else ("down" if d['roi'] < 0 else "flat")
                 item_sign = "+" if d['roi'] > 0 else ""
-                txt.insert(tk.END, f"  • {d['name']} : {int(d['val']):,}원 ")
+                if d.get('is_pure_cash'):
+                    txt.insert(tk.END, f"  • {d['name']} : 평가 {int(d['val']):,}원 / 원가 {int(d['prin']):,}원 ")
+                else:
+                    txt.insert(tk.END, f"  • {d['name']} : 평가 {int(d['val']):,}원 / 매수 {int(d['prin']):,}원 ")
                 txt.insert(tk.END, f"({item_sign}{d['roi']:.2f}%)\n", item_tag)
 
             txt.insert(tk.END, "\n")
@@ -2604,10 +2620,29 @@ class PortfolioApp:
 
             prev_vals = vals.shift(1)
             net_flow = prins.diff().fillna(0.0)
-            pure_day_returns = ((vals - prev_vals - net_flow) / prev_vals.replace(0, np.nan)) * 100.0
+            pure_raw_pct = ((vals - prev_vals - net_flow) / prev_vals.replace(0, np.nan)) * 100.0
+            pure_raw_pct = pure_raw_pct.replace([np.inf, -np.inf], np.nan)
+
+            n_pts = len(dates)
+            bd_after_prev = np.ones(n_pts, dtype=np.float64)
+            for i in range(1, n_pts):
+                bd_after_prev[i] = float(
+                    _count_kr_bdays_after_prev(dates[i - 1], dates[i], _hset)
+                )
+
+            pure_day_returns = pure_raw_pct.copy()
+            if view_mode == "일간" and n_pts > 1:
+                rawv = pure_raw_pct.to_numpy(dtype=np.float64, copy=True)
+                inv_n = 1.0 / bd_after_prev
+                rf = rawv / 100.0
+                base = 1.0 + rf
+                safe = np.isfinite(rf) & (base > 0) & (bd_after_prev > 1)
+                rawv[safe] = (np.power(base[safe], inv_n[safe]) - 1.0) * 100.0
+                pure_day_returns = pd.Series(rawv, index=pure_raw_pct.index)
+
             if not pure_day_returns.empty:
                 pure_day_returns.iloc[0] = 0.0
-            pure_day_returns = pure_day_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            pure_day_returns = pure_day_returns.fillna(0.0)
 
             ax_roi = self.fig_line.add_subplot(311)
             ax_roi.set_facecolor(self.BG)
@@ -2633,9 +2668,11 @@ class PortfolioApp:
                 sign = "+" if r >= 0 else ""
                 ax_pure_day.annotate(f"{sign}{r:.2f}%", (d, r), textcoords="offset points", xytext=(0, 10), ha='center', color='white', fontsize=8, fontweight='bold')
             ax_pure_day.axhline(0, color='white', linestyle=':', linewidth=1, alpha=0.5)
-            pure_day_mode_label = "전일" if view_mode == "일간" else ("전주" if view_mode == "주간" else "전월")
+            pure_day_mode_label = (
+                "직전 기록 대비(영업일 환산)" if view_mode == "일간" else ("전주" if view_mode == "주간" else "전월")
+            )
             ax_pure_day.set_ylabel("입출금 제외 (%)", color="white")
-            ax_pure_day.set_title(f"{pure_day_mode_label} 순수 성과 추이 ({mode_label})", color="white", fontsize=12, fontweight='bold', pad=10)
+            ax_pure_day.set_title(f"{pure_day_mode_label} 순수 성과 ({mode_label})", color="white", fontsize=12, fontweight='bold', pad=10)
             ax_pure_day.tick_params(axis='y', colors='white', labelsize=9)
             ax_pure_day.tick_params(axis='x', colors='white', labelsize=8)
             ax_pure_day.grid(True, linestyle=':', alpha=0.2)
@@ -2649,13 +2686,21 @@ class PortfolioApp:
                 r = float(pure_day_returns.iloc[i])
                 sign = "+" if r >= 0 else ""
                 lbl = "전일 순수 성과" if view_mode == "일간" else ("전주 순수 성과" if view_mode == "주간" else "전월 순수 성과")
-                # 입출금(net_flow) 제외한 전기 대비 원화 손익
                 dval = float((vals - prev_vals - net_flow).iloc[i]) if i < len(vals) else 0.0
                 dval_sign = "+" if dval >= 0 else ""
+                bd = int(bd_after_prev[i]) if i < len(bd_after_prev) else 1
+                raw_r = float(pure_raw_pct.iloc[i]) if i < len(pure_raw_pct) else float("nan")
+                head = f"{_date_with_weekday_kr(dates[i])}\n"
+                if view_mode == "일간" and i > 0 and bd > 1 and math.isfinite(raw_r):
+                    rawsign = "+" if raw_r >= 0 else ""
+                    return (
+                        head
+                        + f"영업일 환산(복리)·일평균: {sign}{r:.2f}%\n"
+                        + f"직전 저장 대비 누적 ({bd}영업일): {rawsign}{raw_r:.2f}%\n"
+                        + f"순수 손익(원): {dval_sign}{int(round(dval)):,}원"
+                    )
                 return (
-                    f"{_date_with_weekday_kr(dates[i])}\n"
-                    f"{lbl}: {sign}{r:.2f}%\n"
-                    f"{lbl} 원화손익: {dval_sign}{int(round(dval)):,}원"
+                    head + f"{lbl}: {sign}{r:.2f}%\n" + f"{lbl} 원화손익: {dval_sign}{int(round(dval)):,}원"
                 )
 
             self._setup_line_series_hover(ax_roi, dates, rois.values, _roi_tip)
