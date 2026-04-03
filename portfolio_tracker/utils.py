@@ -61,6 +61,31 @@ def is_kr_business_day(ts, holiday_dates: Set[datetime.date]) -> bool:
     return True
 
 
+def count_kr_business_days_after_prev(
+    prev_ts,
+    curr_ts,
+    holiday_dates: Set[datetime.date],
+) -> int:
+    """
+    직전 스냅샷일 다음날부터 현재 스냅샷일까지(양 끝 포함)의 한국 영업일 수.
+    일간 순수 수익률을 '며칠치 누적'으로 나누어 영업일 환산할 때 사용한다.
+    """
+    p = pd.Timestamp(prev_ts).normalize()
+    c = pd.Timestamp(curr_ts).normalize()
+    if c <= p:
+        return 1
+    n = 0
+    d = p.date()
+    end = c.date()
+    step = datetime.timedelta(days=1)
+    cur = d + step
+    while cur <= end:
+        if is_kr_business_day(pd.Timestamp(cur), holiday_dates):
+            n += 1
+        cur += step
+    return max(n, 1)
+
+
 def normalize_account_cash_entry(raw: Any) -> Optional[Dict[str, Any]]:
     """JSON의 account_cash 항목을 정규화한다."""
     if not isinstance(raw, dict):
