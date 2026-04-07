@@ -837,12 +837,24 @@ class PortfolioApp:
         rows = []
         total_cat = float(self.current_macro_alloc.get(category, 0.0))
         ex = float(getattr(self, "current_exchange_rate", 1400.0))
+        cash_krw_total = 0.0
+        cash_usd_total = 0.0
+        cash_usd_val_krw_total = 0.0
+        cash_krw_by_account = defaultdict(float)
+        cash_usd_by_account = defaultdict(float)
 
         if category == "현금성 자산":
             for ent in self.account_cash:
                 acc = str(ent.get("account", "")).strip() or "일반 계좌"
                 ck = float(ent.get("cash_krw", 0) or 0)
                 cu = float(ent.get("cash_usd", 0) or 0)
+                cash_krw_total += ck
+                cash_usd_total += cu
+                cash_usd_val_krw_total += (cu * ex)
+                if ck > 0:
+                    cash_krw_by_account[acc] += ck
+                if cu > 0:
+                    cash_usd_by_account[acc] += cu
                 if ck > 0:
                     rows.append((f"예수금 (KRW) · {acc}", ck))
                 if cu > 0:
@@ -866,10 +878,33 @@ class PortfolioApp:
                 desc = f"{name} ({ticker})" if ticker else name
                 if acc:
                     desc += f" · {acc}"
+                # 현금성 자산 통화 분해: 해외 종목은 외화로, 나머지는 원화로 본다.
+                if category == "현금성 자산":
+                    if d.get("is_us"):
+                        qty = float(d.get("qty", 0) or 0)
+                        cur_p = float(d.get("cur_p", 0) or 0)
+                        usd_amt = qty * cur_p
+                        if usd_amt > 0:
+                            cash_usd_total += usd_amt
+                            cash_usd_val_krw_total += val
+                    else:
+                        cash_krw_total += val
             rows.append((desc, val))
 
         rows.sort(key=lambda x: -x[1])
         lines = [f"【{category}】 포함 종목 · 평가금액", "=" * 40, ""]
+        if category == "현금성 자산":
+            lines.append(f"원화 자산 합계: {int(round(cash_krw_total)):,}원")
+            lines.append(f"외화 자산 합계: {cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)")
+            if cash_krw_by_account:
+                lines.append("원화 현금(계좌별):")
+                for acc, amount in sorted(cash_krw_by_account.items(), key=lambda x: -x[1]):
+                    lines.append(f"  - {acc}: {int(round(amount)):,}원")
+            if cash_usd_by_account:
+                lines.append("외화 현금(계좌별):")
+                for acc, amount in sorted(cash_usd_by_account.items(), key=lambda x: -x[1]):
+                    lines.append(f"  - {acc}: {amount:,.2f} USD (원화환산 {int(round(amount * ex)):,}원)")
+            lines.append("")
         if not rows:
             lines.append("(해당 자산군에 표시할 항목이 없습니다.)")
         else:
@@ -1869,7 +1904,8 @@ class PortfolioApp:
 
     def _us_latest_price_from_yahoo_info(self, info):
         """
-        Yahoo Finance quote: 정규장 + 프리마켓 + 애프터마켓 중 시각이 가장 늦은 호가를 고른다.
+        Yahoo Finance API 기준 '가장 최근 시각' 호가: 정규·프리·애프터 구분 없이
+        regularMarketTime / preMarketTime / postMarketTime 중 가장 늦은 타임스탬프의 가격을 쓴다.
         (fast_info.last_price 는 연장 구간을 반영하지 않는 경우가 많음)
         """
         if not isinstance(info, dict) or not info:
@@ -1919,11 +1955,17 @@ class PortfolioApp:
             picked = self._us_latest_price_from_yahoo_info(t.info)
             if picked is not None and picked > 0:
                 return float(picked)
+            # info 실패 시에도 프리/애프터 포함한 최신 봉을 쓴다.
             hist = t.history(period="2d", interval="5m", prepost=True, auto_adjust=True)
             if hist is not None and not hist.empty:
                 last = float(hist["Close"].iloc[-1])
                 if last > 0:
                     return last
+            hist_d = t.history(period="5d", interval="1d", prepost=False, auto_adjust=True)
+            if hist_d is not None and not hist_d.empty:
+                last_d = float(hist_d["Close"].iloc[-1])
+                if last_d > 0:
+                    return last_d
             return float(t.fast_info["last_price"])
         except Exception:
             return 0.0
@@ -2100,6 +2142,9 @@ class PortfolioApp:
                         'account': acc_name,
                         'is_pure_cash': True,
                         'is_usd_cash': cu > 0,
+                        'cash_krw': ck,
+                        'cash_usd': cu,
+                        'cash_usd_val_krw': usd_val_krw,
                         'roi': ((line_val - line_prin) / line_prin * 100) if line_prin > 0 else 0.0,
                         'prof': line_val - line_prin,
                         'fx_prof': usd_val_krw - usd_cost_krw,
@@ -2742,7 +2787,11 @@ class PortfolioApp:
                 sign = "+" if r >= 0 else ""
                 lbl = "전일 순수 성과" if view_mode == "일간" else ("전주 순수 성과" if view_mode == "주간" else "전월 순수 성과")
                 dval = float((vals - prev_vals - net_flow).iloc[i]) if i < len(vals) else 0.0
-                dval_sign = "+" if dval >= 0 else ""
+                if math.isfinite(dval):
+                    dval_sign = "+" if dval >= 0 else ""
+                    dval_text = f"{dval_sign}{int(round(dval)):,}원"
+                else:
+                    dval_text = "N/A"
                 bd = int(bd_after_prev[i]) if i < len(bd_after_prev) else 1
                 raw_r = float(pure_raw_pct.iloc[i]) if i < len(pure_raw_pct) else float("nan")
                 head = f"{_date_with_weekday_kr(dates[i])}\n"
@@ -2752,10 +2801,10 @@ class PortfolioApp:
                         head
                         + f"영업일 환산(복리)·일평균: {sign}{r:.2f}%\n"
                         + f"직전 저장 대비 누적 ({bd}영업일): {rawsign}{raw_r:.2f}%\n"
-                        + f"순수 손익(원): {dval_sign}{int(round(dval)):,}원"
+                        + f"순수 손익(원): {dval_text}"
                     )
                 return (
-                    head + f"{lbl}: {sign}{r:.2f}%\n" + f"{lbl} 원화손익: {dval_sign}{int(round(dval)):,}원"
+                    head + f"{lbl}: {sign}{r:.2f}%\n" + f"{lbl} 원화손익: {dval_text}"
                 )
 
             self._setup_line_series_hover(ax_roi, dates, rois.values, _roi_tip)
@@ -2888,6 +2937,37 @@ class PortfolioApp:
 
         macro_rows = self._macro_category_pnl_rows(report_data)
         if macro_rows:
+            cash_krw_total = 0.0
+            cash_usd_total = 0.0
+            cash_usd_val_krw_total = 0.0
+            for d in report_data:
+                if d.get("is_pure_cash"):
+                    cash_krw_total += float(d.get("cash_krw", 0.0) or 0.0)
+                    usd_amt = float(d.get("cash_usd", 0.0) or 0.0)
+                    usd_krw_val = float(d.get("cash_usd_val_krw", 0.0) or 0.0)
+                    cash_usd_total += usd_amt
+                    cash_usd_val_krw_total += usd_krw_val
+                    continue
+
+                name = d.get("name", "")
+                if d.get("is_fixed"):
+                    cat = get_asset_category(name, "")
+                else:
+                    cat = get_asset_category(name, d.get("ticker", ""))
+                if cat != "현금성 자산":
+                    continue
+
+                val = float(d.get("val", 0.0) or 0.0)
+                if d.get("is_us"):
+                    qty = float(d.get("qty", 0.0) or 0.0)
+                    cur_p = float(d.get("cur_p", 0.0) or 0.0)
+                    usd_amt = qty * cur_p
+                    if usd_amt > 0:
+                        cash_usd_total += usd_amt
+                        cash_usd_val_krw_total += val
+                else:
+                    cash_krw_total += val
+
             txt.insert(tk.END, "\n")
             txt.insert(tk.END, "  ― 자산군별 ―\n", "title")
             for row in macro_rows:
@@ -2902,6 +2982,9 @@ class PortfolioApp:
                 txt.insert(tk.END, f"{sign}{row['roi']:.2f}%\n", tag)
                 txt.insert(tk.END, "     손익 ")
                 txt.insert(tk.END, f"{prof_sign}{int(row['prof']):,}원\n", tag)
+                if row["category"] == "현금성 자산":
+                    txt.insert(tk.END, f"     원화 자산: {int(cash_krw_total):,}원\n")
+                    txt.insert(tk.END, f"     외화 자산: {cash_usd_total:,.2f} USD (원화환산 {int(cash_usd_val_krw_total):,}원)\n")
             txt.insert(tk.END, "\n")
 
         total_tag = "up" if total_roi > 0 else ("down" if total_roi < 0 else "flat")
