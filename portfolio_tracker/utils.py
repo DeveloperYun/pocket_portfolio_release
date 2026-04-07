@@ -201,7 +201,7 @@ def get_asset_category(name: Any, ticker: Any = "") -> str:
     t_sym = normalize_ticker_base(ticker)
     n_sym = normalize_ticker_base(name)
 
-    if t_up == "SGOV" or any(k in n_up for k in ["CD금리", "머니마켓", "KOFR", "파킹", "예수금"]):
+    if t_sym == "SGOV" or t_up == "SGOV" or any(k in n_up for k in ["CD금리", "머니마켓", "KOFR", "파킹", "예수금"]):
         return "현금성 자산"
 
     if (
