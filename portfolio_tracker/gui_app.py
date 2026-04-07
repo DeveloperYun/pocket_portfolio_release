@@ -1867,9 +1867,64 @@ class PortfolioApp:
         except Exception:
             return 0.0
 
+    def _us_latest_price_from_yahoo_info(self, info):
+        """
+        Yahoo Finance quote: 정규장 + 프리마켓 + 애프터마켓 중 시각이 가장 늦은 호가를 고른다.
+        (fast_info.last_price 는 연장 구간을 반영하지 않는 경우가 많음)
+        """
+        if not isinstance(info, dict) or not info:
+            return None
+
+        def fp(x):
+            if x is None:
+                return None
+            try:
+                v = float(x)
+                return v if v > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        def ti(x):
+            if x is None:
+                return None
+            try:
+                return int(x)
+            except (TypeError, ValueError):
+                return None
+
+        reg = fp(info.get("regularMarketPrice") or info.get("currentPrice"))
+        pre = fp(info.get("preMarketPrice"))
+        post = fp(info.get("postMarketPrice"))
+
+        pairs = []
+        rt = ti(info.get("regularMarketTime"))
+        if reg is not None and rt is not None:
+            pairs.append((rt, reg))
+        pt = ti(info.get("preMarketTime"))
+        if pre is not None and pt is not None:
+            pairs.append((pt, pre))
+        pot = ti(info.get("postMarketTime"))
+        if post is not None and pot is not None:
+            pairs.append((pot, post))
+        if pairs:
+            return max(pairs, key=lambda z: z[0])[1]
+        for p in (post, pre, reg):
+            if p is not None:
+                return p
+        return None
+
     def get_us_price(self, ticker):
         try:
-            return float(yf.Ticker(ticker).fast_info['last_price'])
+            t = yf.Ticker(ticker)
+            picked = self._us_latest_price_from_yahoo_info(t.info)
+            if picked is not None and picked > 0:
+                return float(picked)
+            hist = t.history(period="2d", interval="5m", prepost=True, auto_adjust=True)
+            if hist is not None and not hist.empty:
+                last = float(hist["Close"].iloc[-1])
+                if last > 0:
+                    return last
+            return float(t.fast_info["last_price"])
         except Exception:
             return 0.0
 
