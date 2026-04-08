@@ -56,12 +56,15 @@ def _configure_matplotlib_for_tk() -> None:
 
     plt.style.use("dark_background")
 
-    try:
-        import matplotlib.backends._backend_tk as backend_tk
+    # PyInstaller에서만 PIL Tk 브릿지 대신 tk.PhotoImage로 바꿈. 일반 Linux에서는
+    # 네이티브 코드와 충돌해 세그폴트가 날 수 있어 frozen 빌드에 한정한다.
+    if getattr(sys, "frozen", False):
+        try:
+            import matplotlib.backends._backend_tk as backend_tk
 
-        backend_tk.ImageTk.PhotoImage = tk.PhotoImage
-    except Exception:
-        pass
+            backend_tk.ImageTk.PhotoImage = tk.PhotoImage
+        except Exception:
+            pass
 
     if current_os == "Windows":
         plt.rcParams["font.family"] = "Malgun Gothic"
@@ -80,8 +83,6 @@ def _configure_matplotlib_for_tk() -> None:
     plt.rcParams["font.size"] = 11
     plt.rcParams["axes.unicode_minus"] = False
 
-
-_configure_matplotlib_for_tk()
 
 if TYPE_CHECKING:
     import matplotlib.dates as mdates  # noqa: F401
@@ -3065,7 +3066,10 @@ class PortfolioApp:
 
 
 def run() -> None:
+    # Tk 루트를 만든 뒤에 Matplotlib(TkAgg)를 초기화한다. import 시점에 백엔드를
+    # 묶어두면 Wayland/일부 Linux에서 Tk C API와 순서가 꼬여 세그폴트가 난다.
     root = tk.Tk()
+    _configure_matplotlib_for_tk()
     _app = PortfolioApp(root)
 
     def signal_handler(sig, frame):
