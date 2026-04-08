@@ -1263,16 +1263,52 @@ class PortfolioApp:
         self.chart_win = None
         self.report_text_widget = None
 
+    def _show_loading_overlay(self):
+        if not (self.chart_win and self.chart_win.winfo_exists()):
+            return
+        self._loading_overlay = tk.Frame(self.chart_win, bg="#0D1117")
+        self._loading_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        inner = tk.Frame(self._loading_overlay, bg="#161B22", bd=0, highlightthickness=1, highlightbackground="#30363D")
+        inner.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(
+            inner, text="⏳", font=("Segoe UI Emoji", 32), bg="#161B22", fg="#58A6FF"
+        ).pack(pady=(24, 4))
+        tk.Label(
+            inner, text="보고서 갱신 중...", font=(self.FONT_MAIN[0], 16, "bold"),
+            bg="#161B22", fg="#58A6FF"
+        ).pack()
+        tk.Label(
+            inner, text="실시간 시세를 불러오고 있습니다. 잠시만 기다려주세요.",
+            font=(self.FONT_MAIN[0], 11), bg="#161B22", fg="#8B949E"
+        ).pack(pady=(4, 24), padx=32)
+
+        self._loading_overlay.lift()
+        self.chart_win.update_idletasks()
+
+    def _hide_loading_overlay(self):
+        overlay = getattr(self, "_loading_overlay", None)
+        if overlay:
+            try:
+                overlay.destroy()
+            except Exception:
+                pass
+            self._loading_overlay = None
+
     def refresh_report_on_click(self):
         if not (self.chart_win and self.chart_win.winfo_exists()):
             self.lbl_status.config(text="보고서 창이 열려있지 않습니다.", fg="#FF6B6B")
             return
         try:
             self.lbl_status.config(text="보고서 수동 갱신 중...", fg="#87CEFA")
+            self._show_loading_overlay()
             self.root.update_idletasks()
             self.calculate_and_draw(in_place_refresh=True)
         except Exception:
             self.lbl_status.config(text="수동 갱신 실패", fg="#FF6B6B")
+        finally:
+            self._hide_loading_overlay()
 
     # [수정] 자산 추가 시 '계좌명' 항목 포함
     def add_asset(self):
