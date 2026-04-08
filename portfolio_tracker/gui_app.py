@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 
 import matplotlib
 
-from portfolio_tracker import __version__
+from portfolio_tracker.version import __version__
 from portfolio_tracker.realized_pnl import SellRecord, apply_sell_to_portfolio, summarize_realized_pnl
 from portfolio_tracker.utils import (
     currency_formatter,
