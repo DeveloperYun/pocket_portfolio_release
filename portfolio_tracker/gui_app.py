@@ -495,22 +495,24 @@ class PortfolioApp:
             font=self.FONT_CAPTION,
         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+        trade_btn_row = tk.Frame(frame_input, bg=self.CARD_BG)
+        trade_btn_row.grid(row=7, column=0, columnspan=2, pady=(10, 4), sticky="ew")
         self._make_button(
-            frame_input,
+            trade_btn_row,
             text="🟢 매수 입력창",
             command=self.open_buy_trade_window,
             bg=self.ACCENT,
             fg="#0D1117",
-            bold=True
-        ).grid(row=7, column=0, pady=(10, 4), sticky="ew")
+            bold=True,
+        ).pack(side="left", fill="x", expand=True)
         self._make_button(
-            frame_input,
+            trade_btn_row,
             text="🔴 매도 입력창",
             command=self.open_sell_trade_window,
             bg="#E5534B",
             fg="white",
             bold=True,
-        ).grid(row=7, column=1, pady=(10, 4), padx=(10, 0), sticky="ew")
+        ).pack(side="left", fill="x", expand=True, padx=(10, 0))
 
         # 계좌 변경 → 티커 후보 갱신, 티커 선택/입력 → 종목명 자동 채움
         self.ent_account.bind("<<ComboboxSelected>>", lambda _e=None: self.refresh_ticker_options())
