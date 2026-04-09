@@ -497,12 +497,20 @@ class PortfolioApp:
 
         self._make_button(
             frame_input,
-            text="주식/ETF 추가하기",
-            command=self.add_asset,
+            text="🟢 매수 입력창",
+            command=self.open_buy_trade_window,
             bg=self.ACCENT,
             fg="#0D1117",
             bold=True
-        ).grid(row=7, column=0, columnspan=2, pady=(10, 4), sticky="ew")
+        ).grid(row=7, column=0, pady=(10, 4), sticky="ew")
+        self._make_button(
+            frame_input,
+            text="🔴 매도 입력창",
+            command=self.open_sell_trade_window,
+            bg="#E5534B",
+            fg="white",
+            bold=True,
+        ).grid(row=7, column=1, pady=(10, 4), padx=(10, 0), sticky="ew")
 
         # 계좌 변경 → 티커 후보 갱신, 티커 선택/입력 → 종목명 자동 채움
         self.ent_account.bind("<<ComboboxSelected>>", lambda _e=None: self.refresh_ticker_options())
@@ -1205,9 +1213,46 @@ class PortfolioApp:
             return
         self.apply_transparency()
 
+    def _set_window_alpha(self, window) -> None:
+        alpha = float(getattr(self, "current_alpha", 1.0))
+        try:
+            window.attributes("-alpha", alpha)
+            return
+        except Exception:
+            pass
+        try:
+            window.wm_attributes("-alpha", alpha)
+            return
+        except Exception:
+            pass
+        # 일부 Tk/WM 조합은 문자열 파라미터만 받는다.
+        try:
+            window.attributes("-alpha", str(alpha))
+            return
+        except Exception:
+            pass
+        try:
+            window.wm_attributes("-alpha", str(alpha))
+        except Exception:
+            pass
+
+    def _schedule_alpha_sync_for_window(self, window) -> None:
+        def _apply(_event=None):
+            self._set_window_alpha(window)
+
+        try:
+            window.bind("<Map>", _apply, add="+")
+            window.bind("<Visibility>", _apply, add="+")
+            window.bind("<FocusIn>", _apply, add="+")
+            window.after_idle(_apply)
+            for ms in (30, 100, 250, 500, 1000):
+                window.after(ms, _apply)
+        except Exception:
+            pass
+
     def apply_transparency(self):
         try:
-            self.root.attributes('-alpha', self.current_alpha)
+            self._set_window_alpha(self.root)
             alpha_percent = int(round(self.current_alpha * 100))
             alpha_percent = min(100, max(5, alpha_percent))
             if hasattr(self, "lbl_alpha"):
@@ -1216,7 +1261,7 @@ class PortfolioApp:
                 self.alpha_scale.set(alpha_percent)
             for child in self.root.winfo_children():
                 if isinstance(child, tk.Toplevel):
-                    child.attributes('-alpha', self.current_alpha)
+                    self._set_window_alpha(child)
         except Exception:
             pass
 
@@ -1310,6 +1355,454 @@ class PortfolioApp:
             self.lbl_status.config(text="수동 갱신 실패", fg="#FF6B6B")
         finally:
             self._hide_loading_overlay()
+
+    def _auto_save_loaded_portfolio_json(self) -> bool:
+        """
+        현재 불러온 JSON 경로가 있으면 변경사항을 조용히 덮어쓰기 저장한다.
+        """
+        path = self.portfolio_json_path
+        if not path:
+            return False
+        try:
+            self.update_rebalance_config_from_gui()
+            rebalance_ratios = dict(self.target_ratios)
+            data = {
+                "account_cash": self.account_cash,
+                "portfolio": self.portfolio,
+                "sell_records": self.sell_records,
+                "rebalance_enabled": bool(self.rebalance_enabled.get()),
+                "target_ratios": rebalance_ratios,
+                "rebalance_ratios": rebalance_ratios,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            return True
+        except Exception:
+            return False
+
+    def _get_or_create_account_cash(self, account: str) -> dict:
+        acc = str(account or "").strip() or "일반 계좌"
+        for row in self.account_cash:
+            if (str(row.get("account", "")).strip() or "일반 계좌") == acc:
+                if "cash_krw" not in row:
+                    row["cash_krw"] = 0.0
+                if "cash_usd" not in row:
+                    row["cash_usd"] = 0.0
+                if "usd_cost_krw" not in row:
+                    row["usd_cost_krw"] = 0.0
+                return row
+        row = {"account": acc, "cash_krw": 0.0, "cash_usd": 0.0, "usd_cost_krw": 0.0}
+        self.account_cash.append(row)
+        return row
+
+    def _round_avg_price(self, price: float, is_us: bool) -> float:
+        # 추매 계산 시 과도한 소수 자릿수를 줄여 저장값을 안정화한다.
+        return round(float(price), 2 if is_us else 0)
+
+    def open_buy_trade_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("🟢 매수 입력")
+        win.geometry("620x520")
+        win.configure(bg=self.BG)
+        try:
+            win.transient(self.root)
+        except Exception:
+            pass
+        self.bind_escape_to_close(win)
+        try:
+            self._set_window_alpha(win)
+            win.after(50, lambda: self._set_window_alpha(win))
+            win.after(200, lambda: self._set_window_alpha(win))
+        except Exception:
+            pass
+
+        card = self._build_card_frame(win)
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        card.columnconfigure(1, weight=1)
+
+        tk.Label(card, text="계좌", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=0, column=0, sticky="w")
+        ent_acc = ttk.Combobox(
+            card,
+            font=self.FONT_MAIN,
+            state="normal",
+            values=list(self.ent_account["values"]) if hasattr(self, "ent_account") else [],
+            style="Modern.TCombobox",
+        )
+        ent_acc.grid(row=0, column=1, sticky="ew", pady=4, padx=(8, 0))
+        ent_acc.set(str(self.ent_account.get()).strip() or "일반 계좌")
+
+        mode_var = tk.StringVar(value="existing")
+        mode_row = tk.Frame(card, bg=self.CARD_BG)
+        mode_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 6))
+        tk.Radiobutton(mode_row, text="기존 종목 추매", variable=mode_var, value="existing", bg=self.CARD_BG, fg=self.FG, selectcolor=self.ENTRY_BG, font=self.FONT_MAIN).pack(side="left")
+        tk.Radiobutton(mode_row, text="신규 종목 매수", variable=mode_var, value="new", bg=self.CARD_BG, fg=self.FG, selectcolor=self.ENTRY_BG, font=self.FONT_MAIN).pack(side="left", padx=(10, 0))
+
+        tk.Label(card, text="종목코드/티커", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=2, column=0, sticky="w")
+        ent_ticker = ttk.Combobox(card, font=self.FONT_MAIN, state="normal", values=[], style="Modern.TCombobox")
+        ent_ticker.grid(row=2, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="종목명", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=3, column=0, sticky="w")
+        ent_name = self._make_entry(card)
+        ent_name.grid(row=3, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="수량", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=4, column=0, sticky="w")
+        ent_qty = self._make_entry(card)
+        ent_qty.grid(row=4, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="단가(국내 KRW / 미국 USD)", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=5, column=0, sticky="w")
+        ent_price = self._make_entry(card)
+        ent_price.grid(row=5, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="매수 수수료(원)", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=6, column=0, sticky="w")
+        ent_buy_fee = self._make_entry(card)
+        ent_buy_fee.grid(row=6, column=1, sticky="ew", pady=4, padx=(8, 0))
+        ent_buy_fee.insert(0, "0")
+
+        lbl_buy_ex = tk.Label(card, text="매입 환율(KRW/USD, 미국만)", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN)
+        lbl_buy_ex.grid(row=7, column=0, sticky="w")
+        ent_buy_ex = self._make_entry(card)
+        ent_buy_ex.grid(row=7, column=1, sticky="ew", pady=4, padx=(8, 0))
+        try:
+            ent_buy_ex.insert(0, f"{self.get_exchange_rate():.2f}")
+        except Exception:
+            ent_buy_ex.insert(0, "1400")
+
+        tk.Label(card, text="(신규 선택 시) 단위중량(g, 선택)", bg=self.CARD_BG, fg=self.MUTED, font=self.FONT_CAPTION).grid(row=8, column=0, sticky="w")
+        ent_unit_weight = self._make_entry(card)
+        ent_unit_weight.grid(row=8, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="(신규 선택 시) price_source (선택)", bg=self.CARD_BG, fg=self.MUTED, font=self.FONT_CAPTION).grid(row=9, column=0, sticky="w")
+        ent_price_source = self._make_entry(card)
+        ent_price_source.grid(row=9, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="(신규 선택 시) naver category (선택)", bg=self.CARD_BG, fg=self.MUTED, font=self.FONT_CAPTION).grid(row=10, column=0, sticky="w")
+        ent_naver_category = self._make_entry(card)
+        ent_naver_category.grid(row=10, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="(신규 선택 시) naver reutersCode (선택)", bg=self.CARD_BG, fg=self.MUTED, font=self.FONT_CAPTION).grid(row=11, column=0, sticky="w")
+        ent_naver_reuters = self._make_entry(card)
+        ent_naver_reuters.grid(row=11, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="(신규 선택 시) naver unit_price (선택)", bg=self.CARD_BG, fg=self.MUTED, font=self.FONT_CAPTION).grid(row=12, column=0, sticky="w")
+        ent_naver_unit = self._make_entry(card)
+        ent_naver_unit.grid(row=12, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        info_var = tk.StringVar(value="기존 종목이면 '추매 수량/매수단가'로 자동 반영됩니다.")
+        tk.Label(card, textvariable=info_var, bg=self.CARD_BG, fg=self.ACCENT_ALT, font=self.FONT_CAPTION).grid(row=13, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        def _refresh_tickers():
+            acc = str(ent_acc.get()).strip() or "일반 계좌"
+            choices = self._portfolio_choices_for_account(acc)
+            ent_ticker["values"] = [f"{t} | {n} | 보유 {q:g}" for (t, n, q) in choices]
+
+        def _parse_ticker() -> str:
+            return self._parse_ticker_from_combo_value(str(ent_ticker.get())).strip().upper()
+
+        def _sync_buy_ex_state(*_args):
+            ticker = _parse_ticker()
+            is_us = bool(ticker) and (not is_korean_ticker(ticker))
+            ent_buy_ex.config(state=("normal" if is_us else "disabled"))
+            lbl_buy_ex.config(fg=(self.FG if is_us else self.MUTED))
+            acc = str(ent_acc.get()).strip() or "일반 계좌"
+            holding, _ = self._find_portfolio_holding(acc, ticker)
+            if holding and mode_var.get() == "existing":
+                h_qty = float(holding.get("qty", 0) or 0)
+                h_avg = float(holding.get("avg_price", 0) or 0)
+                info_var.set(f"기존 보유: {h_qty:g}주 / 평단 {h_avg:g}{'$' if is_us else '원'}")
+                name = str(holding.get("name", "")).strip()
+                if name and not str(ent_name.get()).strip():
+                    ent_name.insert(0, name)
+                if is_us and holding.get("buy_exchange_rate"):
+                    try:
+                        ent_buy_ex.delete(0, tk.END)
+                        ent_buy_ex.insert(0, f"{float(holding.get('buy_exchange_rate')):g}")
+                    except Exception:
+                        pass
+            elif holding and mode_var.get() == "new":
+                info_var.set("같은 계좌에 동일 티커가 이미 있습니다. 신규보다 추매 모드를 권장합니다.")
+            elif mode_var.get() == "new":
+                info_var.set("신규 종목 매수: test2.json 포맷 필드를 입력 후 반영합니다.")
+            else:
+                info_var.set("기존 종목을 선택하면 추매 수량/매수단가로 반영됩니다.")
+
+        def _confirm_buy():
+            try:
+                account = str(ent_acc.get()).strip() or "일반 계좌"
+                ticker = _parse_ticker()
+                name = str(ent_name.get()).strip()
+                qty = float(str(ent_qty.get()).strip().replace(",", ""))
+                price = float(str(ent_price.get()).strip().replace(",", ""))
+                buy_fee_krw = float(str(ent_buy_fee.get()).strip().replace(",", "") or "0")
+                if qty <= 0 or price <= 0:
+                    messagebox.showwarning("입력 오류", "수량/단가는 0보다 커야 합니다.")
+                    return
+                if buy_fee_krw < 0:
+                    messagebox.showwarning("입력 오류", "매수 수수료는 0 이상이어야 합니다.")
+                    return
+                if not ticker:
+                    messagebox.showwarning("입력 오류", "종목코드/티커를 입력하세요.")
+                    return
+
+                holding, _ = self._find_portfolio_holding(account, ticker)
+                is_us = not is_korean_ticker(ticker)
+                cash_row = self._get_or_create_account_cash(account)
+
+                if mode_var.get() == "existing":
+                    if not holding:
+                        messagebox.showwarning("대상 없음", "해당 계좌의 기존 종목을 찾지 못했습니다. 신규 모드를 사용하세요.")
+                        return
+                    old_qty = float(holding.get("qty", 0) or 0)
+                    old_avg = float(holding.get("avg_price", 0) or 0)
+                    new_qty = old_qty + qty
+                    if new_qty <= 0:
+                        messagebox.showwarning("입력 오류", "반영 후 수량이 0 이하입니다.")
+                        return
+
+                    if is_us:
+                        old_buy_ex = float(holding.get("buy_exchange_rate", 0) or 0)
+                        buy_ex_str = str(ent_buy_ex.get()).strip()
+                        buy_ex = float(buy_ex_str.replace(",", "")) if buy_ex_str else float(self.get_exchange_rate())
+                        if buy_ex <= 0:
+                            messagebox.showwarning("입력 오류", "미국 종목은 매입 환율이 필요합니다.")
+                            return
+                        if old_buy_ex <= 0:
+                            old_buy_ex = buy_ex
+                        total_usd_cost = old_qty * old_avg + qty * price
+                        total_krw_cost = old_qty * old_avg * old_buy_ex + qty * price * buy_ex
+                        holding["qty"] = new_qty
+                        holding["avg_price"] = self._round_avg_price(total_usd_cost / new_qty, is_us=True)
+                        holding["buy_exchange_rate"] = (total_krw_cost / total_usd_cost) if total_usd_cost > 0 else buy_ex
+                        cash_row["cash_usd"] = float(cash_row.get("cash_usd", 0) or 0) - (qty * price)
+                        cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - buy_fee_krw
+                    else:
+                        holding["qty"] = new_qty
+                        holding["avg_price"] = self._round_avg_price(((old_qty * old_avg) + (qty * price)) / new_qty, is_us=False)
+                        cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - ((qty * price) + buy_fee_krw)
+                    if name:
+                        holding["name"] = name
+                    self.listbox.insert(tk.END, f"[매수-추매] [{account}] {holding.get('name', ticker)} ({ticker}) | +{qty:g}주")
+                else:
+                    if holding:
+                        messagebox.showwarning("중복 종목", "같은 계좌에 동일 티커가 이미 존재합니다. 추매 모드를 사용하세요.")
+                        return
+                    if not name:
+                        messagebox.showwarning("입력 오류", "신규 종목은 종목명이 필요합니다.")
+                        return
+                    asset = {"account": account, "ticker": ticker, "name": name, "qty": qty, "avg_price": price}
+                    if is_us:
+                        buy_ex_str = str(ent_buy_ex.get()).strip()
+                        buy_ex = float(buy_ex_str.replace(",", "")) if buy_ex_str else float(self.get_exchange_rate())
+                        if buy_ex <= 0:
+                            messagebox.showwarning("입력 오류", "미국 신규 종목은 매입 환율이 필요합니다.")
+                            return
+                        asset["buy_exchange_rate"] = buy_ex
+                        cash_row["cash_usd"] = float(cash_row.get("cash_usd", 0) or 0) - (qty * price)
+                        cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - buy_fee_krw
+                    else:
+                        cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - ((qty * price) + buy_fee_krw)
+                    unit_weight = str(ent_unit_weight.get()).strip()
+                    if unit_weight:
+                        asset["unit_weight_g"] = float(unit_weight.replace(",", ""))
+                    price_source = str(ent_price_source.get()).strip()
+                    if price_source:
+                        asset["price_source"] = price_source
+                    n_cat = str(ent_naver_category.get()).strip()
+                    n_reu = str(ent_naver_reuters.get()).strip()
+                    n_unit = str(ent_naver_unit.get()).strip()
+                    if n_cat or n_reu or n_unit:
+                        asset["naver_marketindex"] = {}
+                        if n_cat:
+                            asset["naver_marketindex"]["category"] = n_cat
+                        if n_reu:
+                            asset["naver_marketindex"]["reutersCode"] = n_reu
+                        if n_unit:
+                            asset["naver_marketindex"]["unit_price"] = n_unit
+                    self.portfolio.append(asset)
+                    self.listbox.insert(tk.END, f"[매수-신규] [{account}] {name} ({ticker}) | {qty:g}주")
+
+                self.refresh_account_options(preferred_account=account)
+                saved = self._auto_save_loaded_portfolio_json()
+                messagebox.showinfo("반영 완료", "매수 내역을 포트폴리오 JSON 데이터에 반영했습니다." + ("\n(불러온 JSON 파일에도 자동 저장됨)" if saved else ""))
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("매수 반영 실패", f"매수 입력 반영 중 오류가 발생했습니다.\n\n{e}")
+
+        ent_acc.bind("<<ComboboxSelected>>", lambda _e=None: (_refresh_tickers(), _sync_buy_ex_state()))
+        ent_ticker.bind("<<ComboboxSelected>>", lambda _e=None: _sync_buy_ex_state())
+        ent_ticker.bind("<FocusOut>", lambda _e=None: _sync_buy_ex_state())
+        mode_var.trace_add("write", lambda *_: _sync_buy_ex_state())
+        _refresh_tickers()
+        _sync_buy_ex_state()
+
+        btn_row = tk.Frame(win, bg=self.BG)
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+        self._make_button(btn_row, "확인", _confirm_buy, bg=self.ACCENT, fg="#0D1117", bold=True, pad=(12, 7)).pack(side="left")
+        self._make_button(btn_row, "닫기", win.destroy, bg=self.BTN_BG, fg=self.FG, bold=False, pad=(12, 7)).pack(side="left", padx=(8, 0))
+        self._schedule_alpha_sync_for_window(win)
+        self.apply_transparency()
+
+    def open_sell_trade_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("🔴 매도 입력")
+        win.geometry("620x360")
+        win.configure(bg=self.BG)
+        try:
+            win.transient(self.root)
+        except Exception:
+            pass
+        self.bind_escape_to_close(win)
+        try:
+            self._set_window_alpha(win)
+            win.after(50, lambda: self._set_window_alpha(win))
+            win.after(200, lambda: self._set_window_alpha(win))
+        except Exception:
+            pass
+
+        card = self._build_card_frame(win)
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        card.columnconfigure(1, weight=1)
+
+        tk.Label(card, text="계좌", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=0, column=0, sticky="w")
+        ent_acc = ttk.Combobox(
+            card,
+            font=self.FONT_MAIN,
+            state="readonly",
+            values=list(self.ent_account["values"]) if hasattr(self, "ent_account") else [],
+            style="Modern.TCombobox",
+        )
+        ent_acc.grid(row=0, column=1, sticky="ew", pady=4, padx=(8, 0))
+        ent_acc.set(str(self.ent_account.get()).strip() or "일반 계좌")
+
+        tk.Label(card, text="종목", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=1, column=0, sticky="w")
+        ent_ticker = ttk.Combobox(card, font=self.FONT_MAIN, state="readonly", values=[], style="Modern.TCombobox")
+        ent_ticker.grid(row=1, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="매도 수량", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=2, column=0, sticky="w")
+        ent_qty = self._make_entry(card)
+        ent_qty.grid(row=2, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="매도 단가(국내 KRW / 미국 USD)", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=3, column=0, sticky="w")
+        ent_price = self._make_entry(card)
+        ent_price.grid(row=3, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(card, text="매도 수수료(원)", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN).grid(row=4, column=0, sticky="w")
+        ent_sell_fee = self._make_entry(card)
+        ent_sell_fee.grid(row=4, column=1, sticky="ew", pady=4, padx=(8, 0))
+        ent_sell_fee.insert(0, "0")
+
+        lbl_sell_ex = tk.Label(card, text="매도 환율(KRW/USD, 미국만)", bg=self.CARD_BG, fg=self.FG, font=self.FONT_MAIN)
+        lbl_sell_ex.grid(row=5, column=0, sticky="w")
+        ent_sell_ex = self._make_entry(card)
+        ent_sell_ex.grid(row=5, column=1, sticky="ew", pady=4, padx=(8, 0))
+        try:
+            ent_sell_ex.insert(0, f"{self.get_exchange_rate():.2f}")
+        except Exception:
+            ent_sell_ex.insert(0, "1400")
+
+        def _parse_ticker() -> str:
+            raw = str(ent_ticker.get() or "").strip()
+            if not raw:
+                return ""
+            return raw.split("|", 1)[0].strip().upper()
+
+        def _find_holding(account: str, ticker: str):
+            for item in self.portfolio:
+                acc = str(item.get("account", "")).strip() or "일반 계좌"
+                t = str(item.get("ticker", "")).strip().upper()
+                if acc == account and t == ticker:
+                    return item
+            return None
+
+        def _refresh_ticker_choices(*_args):
+            acc = str(ent_acc.get()).strip() or "일반 계좌"
+            choices = self._portfolio_choices_for_account(acc)
+            ent_ticker["values"] = [f"{t} | {n} | 보유 {q:g}" for (t, n, q) in choices]
+            if choices:
+                ent_ticker.set(ent_ticker["values"][0])
+            else:
+                ent_ticker.set("")
+            _sync_sell_ex_state()
+
+        def _sync_sell_ex_state(*_args):
+            ticker = _parse_ticker()
+            is_us = bool(ticker) and (not is_korean_ticker(ticker))
+            ent_sell_ex.config(state=("normal" if is_us else "disabled"))
+            lbl_sell_ex.config(fg=(self.FG if is_us else self.MUTED))
+
+        def _confirm_sell():
+            try:
+                account = str(ent_acc.get()).strip() or "일반 계좌"
+                ticker = _parse_ticker()
+                if not ticker:
+                    messagebox.showwarning("입력 오류", "매도할 종목을 선택하세요.")
+                    return
+                holding = _find_holding(account, ticker)
+                if not holding:
+                    messagebox.showwarning("대상 없음", "해당 계좌/종목 보유 내역을 찾지 못했습니다.")
+                    return
+                qty = float(str(ent_qty.get()).strip().replace(",", ""))
+                price = float(str(ent_price.get()).strip().replace(",", ""))
+                sell_fee_krw = float(str(ent_sell_fee.get()).strip().replace(",", "") or "0")
+                if qty <= 0 or price <= 0:
+                    messagebox.showwarning("입력 오류", "수량/단가는 0보다 커야 합니다.")
+                    return
+                if sell_fee_krw < 0:
+                    messagebox.showwarning("입력 오류", "매도 수수료는 0 이상이어야 합니다.")
+                    return
+                name = str(holding.get("name", "")).strip() or ticker
+                is_us = not is_korean_ticker(ticker)
+                sell_ex = None
+                if is_us:
+                    sell_ex = float(str(ent_sell_ex.get()).strip().replace(",", ""))
+                    if sell_ex <= 0:
+                        messagebox.showwarning("입력 오류", "미국 종목은 매도 환율이 필요합니다.")
+                        return
+
+                rec = SellRecord(
+                    sell_date=datetime.date.today().strftime("%Y-%m-%d"),
+                    account=account,
+                    ticker=ticker,
+                    name=name,
+                    qty=qty,
+                    sell_price=price,
+                    is_us=is_us,
+                    sell_exchange_rate=sell_ex,
+                    fee_krw=sell_fee_krw,
+                    memo="",
+                ).normalized()
+
+                old_qty = float(holding.get("qty", 0) or 0)
+                if rec.qty > old_qty + 1e-12:
+                    messagebox.showwarning("수량 오류", f"매도 수량이 보유 수량을 초과합니다.\n보유: {old_qty:g} / 매도: {rec.qty:g}")
+                    return
+
+                self.sell_records.append(rec.to_json())
+                self._merge_and_persist_sell_records([])
+                self.portfolio = apply_sell_to_portfolio(self.portfolio, rec)
+                cash_row = self._get_or_create_account_cash(account)
+                if is_us:
+                    cash_row["cash_usd"] = float(cash_row.get("cash_usd", 0) or 0) + (qty * price)
+                    cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - sell_fee_krw
+                else:
+                    cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) + (qty * price) - sell_fee_krw
+                self.listbox.insert(tk.END, f"[매도] [{account}] {name} ({ticker}) | {rec.qty:g}주")
+                self.refresh_account_options(preferred_account=account)
+                saved = self._auto_save_loaded_portfolio_json()
+                messagebox.showinfo("반영 완료", "매도 내역을 포트폴리오 JSON 데이터에 반영했습니다." + ("\n(불러온 JSON 파일에도 자동 저장됨)" if saved else ""))
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("매도 반영 실패", f"매도 입력 반영 중 오류가 발생했습니다.\n\n{e}")
+
+        ent_acc.bind("<<ComboboxSelected>>", _refresh_ticker_choices)
+        ent_ticker.bind("<<ComboboxSelected>>", _sync_sell_ex_state)
+        _refresh_ticker_choices()
+
+        btn_row = tk.Frame(win, bg=self.BG)
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+        self._make_button(btn_row, "확인", _confirm_sell, bg="#E5534B", fg="white", bold=True, pad=(12, 7)).pack(side="left")
+        self._make_button(btn_row, "닫기", win.destroy, bg=self.BTN_BG, fg=self.FG, bold=False, pad=(12, 7)).pack(side="left", padx=(8, 0))
+        self._schedule_alpha_sync_for_window(win)
+        self.apply_transparency()
 
     # [수정] 자산 추가 시 '계좌명' 항목 포함
     def add_asset(self):
@@ -1687,8 +2180,8 @@ class PortfolioApp:
 
     def open_realized_pnl_report(self):
         """
-        매도 기록 입력 + 기간별(일/주/월/년) 실현손익 요약을 보여준다.
-        해외 종목은 매도환율(sell_exchange_rate)을 함께 기록해 KRW 기준 손익을 계산한다.
+        기간별(일/주/월/년) 실현손익 요약을 보여준다.
+        매도 입력은 메인 화면의 '매도 입력창'에서 처리한다.
         """
         win = tk.Toplevel(self.root)
         win.title("🧾 실현손익 리포트")
@@ -1893,8 +2386,14 @@ class PortfolioApp:
 
         btn_row = tk.Frame(win, bg=self.BG)
         btn_row.pack(fill="x", padx=12, pady=(0, 12))
-        self._make_button(btn_row, "➕ 매도 기록 추가", on_add_sell, bg=self.ACCENT, fg="#0D1117", bold=True, pad=(12, 7)).pack(side="left")
-        self._make_button(btn_row, "🔄 리포트 새로고침", refresh_report_view, bg="#2E8B57", fg="white", bold=True, pad=(12, 7)).pack(side="left", padx=(8, 0))
+        self._make_button(btn_row, "🔄 리포트 새로고침", refresh_report_view, bg="#2E8B57", fg="white", bold=True, pad=(12, 7)).pack(side="left")
+        tk.Label(
+            btn_row,
+            text="매도 반영은 메인 화면의 '매도 입력창'을 이용하세요.",
+            bg=self.BG,
+            fg=self.MUTED,
+            font=self.FONT_CAPTION,
+        ).pack(side="left", padx=(10, 0))
 
         refresh_report_view()
 
