@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import platform
 from typing import Any, Dict, Optional, Set
@@ -132,6 +133,39 @@ def get_user_data_dir() -> str:
 
 def get_history_file_path() -> str:
     return os.path.join(get_user_data_dir(), "portfolio_history.json")
+
+
+def get_history_path_config_file() -> str:
+    """사용자가 선택한 일별 히스토리 JSON 경로를 저장하는 설정 파일."""
+    return os.path.join(get_user_data_dir(), "portfolio_history_location.json")
+
+
+def resolve_portfolio_history_file_path() -> str:
+    """
+    일별 스냅샷(portfolio_history) JSON 경로.
+    설정에 저장된 경로가 있으면 그것을, 없으면 기본 사용자 데이터 경로를 쓴다.
+    """
+    default = get_history_file_path()
+    cfg = get_history_path_config_file()
+    if not os.path.exists(cfg):
+        return default
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            data = json.load(f)
+        p = data.get("path")
+        if isinstance(p, str) and p.strip():
+            return os.path.normpath(os.path.expanduser(p.strip()))
+    except Exception:
+        pass
+    return default
+
+
+def save_portfolio_history_file_path(path: str) -> None:
+    """선택한 히스토리 JSON 경로를 사용자 설정에 저장한다."""
+    norm = os.path.normpath(os.path.expanduser(path.strip()))
+    cfg = get_history_path_config_file()
+    with open(cfg, "w", encoding="utf-8") as f:
+        json.dump({"path": norm}, f, indent=2, ensure_ascii=False)
 
 
 def get_realized_pnl_records_file_path() -> str:
