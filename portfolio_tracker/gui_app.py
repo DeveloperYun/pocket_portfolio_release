@@ -28,6 +28,8 @@ from portfolio_tracker.utils import (
     date_with_weekday_kr as _date_with_weekday_kr,
     get_asset_category,
     get_history_file_path,
+    resolve_portfolio_history_file_path,
+    save_portfolio_history_file_path,
     get_realized_pnl_records_file_path,
     is_kr_business_day as _is_kr_business_day,
     is_korean_ticker,
@@ -130,6 +132,9 @@ class PortfolioApp:
         self.current_exchange_rate = 1400.0
         self.rebalance_enabled = tk.BooleanVar(value=False)
         self.target_ratios = {"주식": 20.0, "채권": 20.0, "금": 20.0, "원자재": 20.0, "현금성 자산": 20.0}
+
+        # 일별 수익률/스냅샷 JSON — 사용자가 메인 화면 상단에서 경로 지정(설정에 저장)
+        self.portfolio_history_path = resolve_portfolio_history_file_path()
 
         self.create_widgets()
         self.bind_escape_to_close(self.root)
@@ -437,7 +442,7 @@ class PortfolioApp:
         frame_input.pack(pady=6, fill='x', padx=20)
         frame_input.columnconfigure(1, weight=1)
 
-        # [수정] 계좌명 입력란: 선택 + 직접 입력(Combobox)
+        # 거래 기준 계좌(매수/매도 팝업에서 기본값으로 사용)
         self._make_label(frame_input, "계좌명").grid(row=0, column=0, sticky='w')
         self.ent_account = ttk.Combobox(
             frame_input,
@@ -449,54 +454,16 @@ class PortfolioApp:
         self.ent_account.grid(row=0, column=1, pady=5, padx=(10, 0), sticky="ew")
         self.ent_account.set("일반 계좌")
 
-        self._make_label(frame_input, "종목코드/티커").grid(row=1, column=0, sticky='w')
-        # 계좌 선택 시 해당 계좌 보유 종목을 콤보박스로 선택할 수 있게 한다(직접 입력도 허용).
-        self.ent_ticker = ttk.Combobox(
+        tk.Label(
             frame_input,
-            font=self.FONT_MAIN,
-            state="normal",
-            values=[],
-            style="Modern.TCombobox",
-        )
-        self.ent_ticker.grid(row=1, column=1, pady=5, padx=(10, 0), sticky="ew")
-
-        self._make_label(frame_input, "종목명").grid(row=2, column=0, sticky='w')
-        self.ent_name = self._make_entry(frame_input)
-        self.ent_name.grid(row=2, column=1, pady=5, padx=(10, 0), sticky="ew")
-
-        self._make_label(frame_input, "보유 수량").grid(row=3, column=0, sticky='w')
-        self.ent_qty = self._make_entry(frame_input)
-        self.ent_qty.grid(row=3, column=1, pady=5, padx=(10, 0), sticky="ew")
-
-        self._make_label(frame_input, "평균단가 (원/달러)").grid(row=4, column=0, sticky='w')
-        self.ent_avg = self._make_entry(frame_input)
-        self.ent_avg.grid(row=4, column=1, pady=5, padx=(10, 0), sticky="ew")
-
-        self.lbl_buy_ex = self._make_label(frame_input, "매입 환율(KRW/USD)")
-        self.lbl_buy_ex.grid(row=5, column=0, sticky="w")
-        self.ent_buy_ex = self._make_entry(frame_input)
-        self.ent_buy_ex.grid(row=5, column=1, pady=5, padx=(10, 0), sticky="ew")
-        try:
-            self.ent_buy_ex.insert(0, f"{float(getattr(self, 'current_exchange_rate', 1400.0)):g}")
-        except Exception:
-            pass
-
-        # 추가매수 모드: 기존 보유 종목이면 (추가 매수수량, 매수가)만 입력해도 평단/수량을 자동 갱신한다.
-        self.add_buy_mode = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            frame_input,
-            text="추가매수 모드(기존 종목이면 평단/수량 자동계산)",
-            variable=self.add_buy_mode,
+            text="매수/매도 입력은 아래 버튼의 별도 팝업에서 처리합니다.",
             bg=self.CARD_BG,
-            fg=self.FG,
-            selectcolor=self.ENTRY_BG,
-            activebackground=self.CARD_BG,
-            activeforeground=self.FG,
+            fg=self.MUTED,
             font=self.FONT_CAPTION,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 4))
 
         trade_btn_row = tk.Frame(frame_input, bg=self.CARD_BG)
-        trade_btn_row.grid(row=7, column=0, columnspan=2, pady=(10, 4), sticky="ew")
+        trade_btn_row.grid(row=2, column=0, columnspan=2, pady=(8, 4), sticky="ew")
         self._make_button(
             trade_btn_row,
             text="🟢 매수 입력창",
@@ -513,15 +480,6 @@ class PortfolioApp:
             fg="white",
             bold=True,
         ).pack(side="left", fill="x", expand=True, padx=(10, 0))
-
-        # 계좌 변경 → 티커 후보 갱신, 티커 선택/입력 → 종목명 자동 채움
-        self.ent_account.bind("<<ComboboxSelected>>", lambda _e=None: self.refresh_ticker_options())
-        self.ent_account.bind("<FocusOut>", lambda _e=None: self.refresh_ticker_options())
-        self.ent_ticker.bind("<<ComboboxSelected>>", lambda _e=None: (self._sync_buy_ex_enabled_from_ticker(), self._autofill_name_from_ticker()))
-        self.ent_ticker.bind("<FocusOut>", lambda _e=None: (self._sync_buy_ex_enabled_from_ticker(), self._autofill_name_from_ticker()))
-
-        # 초기 상태 동기화
-        self._sync_buy_ex_enabled_from_ticker()
 
         frame_cash = self._build_card_frame(self.main_content)
         frame_cash.pack(pady=6, fill='x', padx=20)
@@ -550,6 +508,47 @@ class PortfolioApp:
             fg=self.MUTED,
             font=self.FONT_CAPTION
         ).grid(row=3, column=0, columnspan=2, sticky='w')
+
+        frame_hist = self._build_card_frame(self.main_content)
+        frame_hist.pack(pady=6, fill="x", padx=20)
+        tk.Label(
+            frame_hist,
+            text="포트폴리오 히스토리 (일별 스냅샷) 파일",
+            font=(self.FONT_MAIN[0], 12, "bold"),
+            bg=self.CARD_BG,
+            fg=self.FG,
+        ).pack(anchor="w")
+        tk.Label(
+            frame_hist,
+            text="「계산 및 차트/수익률 보기」 실행 시 이 JSON에 누적 저장됩니다. 사용할 파일을 고릅니다. 아직 파일이 없으면 해당 위치에 빈 .json을 만든 뒤 선택하세요.",
+            bg=self.CARD_BG,
+            fg=self.MUTED,
+            font=self.FONT_CAPTION,
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 8))
+        hist_row = tk.Frame(frame_hist, bg=self.CARD_BG)
+        hist_row.pack(fill="x")
+        self.lbl_portfolio_history_path = tk.Label(
+            hist_row,
+            text="",
+            bg=self.CARD_BG,
+            fg=self.ACCENT_ALT,
+            font=self.FONT_CAPTION,
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        )
+        self.lbl_portfolio_history_path.pack(side="left", fill="x", expand=True)
+        self._make_button(
+            hist_row,
+            text="파일 선택…",
+            command=self.choose_portfolio_history_path,
+            bg="#304B67",
+            bold=True,
+            pad=(10, 6),
+        ).pack(side="right", padx=(8, 0))
+        self._refresh_portfolio_history_path_label()
 
         frame_file = tk.Frame(self.main_content, bg=self.BG)
         frame_file.pack(pady=6, padx=20, fill="x")
@@ -698,6 +697,8 @@ class PortfolioApp:
         self.alpha_scale.pack(side='left', fill='x', expand=True)
 
     def refresh_account_options(self, preferred_account=None):
+        if not hasattr(self, "ent_account"):
+            return
         accounts = set()
         for item in self.portfolio:
             acc = str(item.get("account", "")).strip() or "일반 계좌"
@@ -716,13 +717,13 @@ class PortfolioApp:
 
         target = str(preferred_account or "").strip() or current_value or "일반 계좌"
         self.ent_account.set(target)
-        # 계좌 콤보박스 갱신 후, 해당 계좌의 티커 후보도 함께 갱신
-        self.refresh_ticker_options(preferred_account=target)
 
     def refresh_ticker_options(self, preferred_account: str | None = None):
         """
         현재(또는 preferred_account) 계좌에 포함된 종목 ticker를 콤보박스 후보로 갱신한다.
         """
+        if not hasattr(self, "ent_ticker"):
+            return
         account = str(preferred_account or "").strip() or str(self.ent_account.get()).strip() or "일반 계좌"
         try:
             current_ticker = self._parse_ticker_from_combo_value(str(self.ent_ticker.get() or ""))
@@ -2597,10 +2598,39 @@ class PortfolioApp:
 
         return guides, None
 
+    def _refresh_portfolio_history_path_label(self) -> None:
+        if not hasattr(self, "lbl_portfolio_history_path"):
+            return
+        p = self.portfolio_history_path
+        self.lbl_portfolio_history_path.config(text=p)
+
+    def choose_portfolio_history_path(self) -> None:
+        # 저장 대화상자(asksaveasfilename)는 기존 파일을 고를 때 덮어쓰기 확인이 뜬다.
+        # 일별 히스토리는 기존 JSON을 지정하는 경우가 많으므로 열기 대화상자를 쓴다.
+        initial_dir = os.path.dirname(os.path.abspath(self.portfolio_history_path))
+        if not os.path.isdir(initial_dir):
+            initial_dir = os.path.expanduser("~")
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="포트폴리오 히스토리 JSON 파일 선택",
+            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+            initialdir=initial_dir,
+        )
+        if not path:
+            return
+        self.portfolio_history_path = os.path.normpath(os.path.expanduser(path))
+        try:
+            save_portfolio_history_file_path(self.portfolio_history_path)
+        except Exception as e:
+            messagebox.showerror("설정 저장 실패", f"히스토리 경로 설정을 저장하지 못했습니다.\n{e}")
+            return
+        self._refresh_portfolio_history_path_label()
+
     def save_and_get_history(self, total_roi, total_prin, total_val, macro_alloc):
-        filename = get_history_file_path()
+        filename = self.portfolio_history_path
         history = {}
         legacy_filename = "portfolio_history.json"
+        default_store = get_history_file_path()
 
         if os.path.exists(filename):
             try:
@@ -2608,8 +2638,8 @@ class PortfolioApp:
                     history = json.load(f)
             except Exception:
                 pass
-        elif os.path.exists(legacy_filename):
-            # 기존 상대경로 파일이 있으면 최초 1회 자동 마이그레이션
+        elif os.path.abspath(filename) == os.path.abspath(default_store) and os.path.exists(legacy_filename):
+            # 기본 저장 경로이고 아직 없을 때만, 작업 디렉터리의 구버전 파일을 1회 마이그레이션
             try:
                 with open(legacy_filename, 'r', encoding='utf-8') as f:
                     history = json.load(f)
@@ -2625,6 +2655,9 @@ class PortfolioApp:
         history[today] = {"roi": total_roi, "principal": total_prin, "value": total_val, "allocation": alloc_record}
 
         try:
+            parent = os.path.dirname(os.path.abspath(filename))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(history, f, indent=4, ensure_ascii=False)
         except Exception:
