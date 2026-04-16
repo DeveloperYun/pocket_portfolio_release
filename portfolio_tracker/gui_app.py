@@ -127,6 +127,13 @@ class PortfolioApp:
         self.chart_auto_refresh_job = None
         self.chart_auto_refresh_interval_ms = 30000
         self.current_chart_view_mode = "일간"
+        self.daily_window_size = 20
+        self.daily_window_start = 0
+        self.daily_window_max_start = 0
+        self.daily_window_follow_latest = True
+        self.daily_window_scale = None
+        self.daily_window_label = None
+        self._updating_daily_window_scale = False
         self.report_text_widget = None
         self.current_report_data = []
         self.current_exchange_rate = 1400.0
@@ -1311,6 +1318,21 @@ class PortfolioApp:
             pass
         self.chart_win = None
         self.report_text_widget = None
+        self.daily_window_scale = None
+        self.daily_window_label = None
+
+    def _on_daily_window_scroll(self, value):
+        if self._updating_daily_window_scale:
+            return
+        try:
+            start = int(float(value))
+        except Exception:
+            start = 0
+        start = max(0, min(start, int(getattr(self, "daily_window_max_start", 0))))
+        self.daily_window_start = start
+        self.daily_window_follow_latest = (start >= int(getattr(self, "daily_window_max_start", 0)))
+        if getattr(self, "current_chart_view_mode", "일간") == "일간":
+            self.update_line_chart("일간")
 
     def _show_loading_overlay(self):
         if not (self.chart_win and self.chart_win.winfo_exists()):
@@ -2900,6 +2922,33 @@ class PortfolioApp:
             )
             self.btn_manual_refresh.pack(side='left', expand=True, fill='x', padx=2)
 
+            daily_scroll_frame = tk.Frame(left_frame, bg=self.CARD_BG)
+            daily_scroll_frame.pack(side='top', fill='x', padx=10, pady=(0, 6))
+            self.daily_window_label = tk.Label(
+                daily_scroll_frame,
+                text=f"일간 구간: 최근 {self.daily_window_size}일",
+                bg=self.CARD_BG,
+                fg=self.MUTED,
+                font=self.FONT_CAPTION,
+                anchor='w'
+            )
+            self.daily_window_label.pack(side='top', fill='x')
+            self.daily_window_scale = tk.Scale(
+                daily_scroll_frame,
+                from_=0,
+                to=0,
+                orient='horizontal',
+                resolution=1,
+                showvalue=False,
+                command=self._on_daily_window_scroll,
+                bg=self.CARD_BG,
+                fg=self.FG,
+                troughcolor=self.ENTRY_BG,
+                highlightthickness=0
+            )
+            self.daily_window_scale.pack(side='top', fill='x')
+            self.daily_window_follow_latest = True
+
             line_frame = tk.Frame(left_frame, bg=self.BG)
             line_frame.pack(side='bottom', fill='both', expand=True)
 
@@ -3279,6 +3328,41 @@ class PortfolioApp:
         if view_mode == "월간":
             df = df.groupby(df.index.to_period('M')).last()
             df.index = df.index.to_timestamp()
+
+        if view_mode == "일간" and not df.empty:
+            total_points = len(df)
+            max_start = max(0, total_points - int(self.daily_window_size))
+            self.daily_window_max_start = max_start
+
+            if self.daily_window_follow_latest:
+                start = max_start
+            else:
+                start = max(0, min(int(self.daily_window_start), max_start))
+            end = min(total_points, start + int(self.daily_window_size))
+            self.daily_window_start = start
+            df = df.iloc[start:end]
+
+            if self.daily_window_scale and self.daily_window_scale.winfo_exists():
+                self._updating_daily_window_scale = True
+                try:
+                    self.daily_window_scale.config(to=max_start, state=('normal' if max_start > 0 else 'disabled'))
+                    self.daily_window_scale.set(start)
+                finally:
+                    self._updating_daily_window_scale = False
+
+            if self.daily_window_label and self.daily_window_label.winfo_exists():
+                self.daily_window_label.config(
+                    text=f"일간 구간: {start + 1}~{end} / {total_points}일 (가로 스크롤로 이동)"
+                )
+        elif self.daily_window_scale and self.daily_window_scale.winfo_exists():
+            self._updating_daily_window_scale = True
+            try:
+                self.daily_window_scale.config(to=0, state='disabled')
+                self.daily_window_scale.set(0)
+            finally:
+                self._updating_daily_window_scale = False
+            if self.daily_window_label and self.daily_window_label.winfo_exists():
+                self.daily_window_label.config(text=f"일간 구간: 최근 {self.daily_window_size}일")
 
         self.fig_line.clf()
         mode_label = view_mode if view_mode in ("일간", "주간", "월간") else "일간"
