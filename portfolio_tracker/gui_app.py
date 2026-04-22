@@ -2904,6 +2904,17 @@ class PortfolioApp:
                 side='left', expand=True, fill='x', padx=2
             )
 
+            alloc_trend_frame = tk.Frame(left_frame, bg=self.CARD_BG)
+            alloc_trend_frame.pack(side='top', fill='x', pady=(0, 5), padx=10)
+            self._make_button(
+                alloc_trend_frame,
+                "📊 자산분배 추이",
+                self.show_allocation_trend_menu,
+                bg="#3D5A80",
+                fg="white",
+                bold=True,
+            ).pack(side='left', fill='x', expand=True)
+
             btn_frame = tk.Frame(left_frame, bg=self.CARD_BG)
             btn_frame.pack(side='top', fill='x', pady=5, padx=10)
             self.btn_daily = self._make_button(btn_frame, "일간 수익률", lambda: self.update_line_chart("일간"), bg="#FFD700", fg="black", bold=True)
@@ -3044,6 +3055,234 @@ class PortfolioApp:
             txt.insert(tk.END, "\n")
 
         txt.config(state='disabled')
+
+    def _ordered_allocation_categories(self) -> list:
+        """히스토리에 등장한 자산군 키를 UI 일관된 순서로 정렬."""
+        preferred = ("주식", "채권", "금", "원자재", "현금성 자산")
+        hist = getattr(self, "history_data", None) or {}
+        found: set = set()
+        for rec in hist.values():
+            a = (rec or {}).get("allocation")
+            if isinstance(a, dict):
+                found.update(a.keys())
+        return [c for c in preferred if c in found] + sorted(c for c in found if c not in preferred)
+
+    def _allocation_history_dataframe(self):
+        """
+        history_data로부터 날짜 인덱스·자산군별 금액/비중 컬럼 DataFrame.
+        allocation이 없는 날짜/자산은 NaN.
+        """
+        categories = self._ordered_allocation_categories()
+        hist = getattr(self, "history_data", None) or {}
+        if not hist:
+            return None, []
+        if not categories:
+            return None, []
+        rows = []
+        idx = []
+        for d in sorted(hist.keys()):
+            rec = hist[d] or {}
+            alloc = rec.get("allocation")
+            if not isinstance(alloc, dict):
+                alloc = {}
+            idx.append(pd.Timestamp(d))
+            r = {}
+            for cat in categories:
+                c = alloc.get(cat)
+                if isinstance(c, dict):
+                    r[f"__amt__{cat}"] = c.get("amount", float("nan"))
+                    r[f"__pct__{cat}"] = c.get("percent", float("nan"))
+                else:
+                    r[f"__amt__{cat}"] = float("nan")
+                    r[f"__pct__{cat}"] = float("nan")
+            rows.append(r)
+        df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx))
+        df = df.sort_index()
+        return df, categories
+
+    def _aggregate_allocation_dataframe(self, df: pd.DataFrame, view_mode: str) -> pd.DataFrame:
+        """update_line_chart와 유사: 영업일만 사용 후 주/월/분기 말(마지막 기록) 집계."""
+        if df is None or df.empty:
+            return df
+        out = df.copy()
+        if not out.empty:
+            _hset = _kr_holiday_date_set(out.index.min(), out.index.max())
+            out = out.loc[out.index.map(lambda t: _is_kr_business_day(t, _hset))]
+        if out.empty:
+            return out
+        if view_mode == "주간":
+            out = out.groupby(out.index.to_period("W-FRI")).last()
+            out.index = out.index.to_timestamp()
+        elif view_mode == "월간":
+            out = out.groupby(out.index.to_period("M")).last()
+            out.index = out.index.to_timestamp()
+        elif view_mode == "분기":
+            out = out.groupby(out.index.to_period("Q")).last()
+            out.index = out.index.to_timestamp()
+        return out
+
+    def show_allocation_trend_menu(self) -> None:
+        if not (self.chart_win and self.chart_win.winfo_exists()):
+            return
+        hist = getattr(self, "history_data", None) or {}
+        if not hist:
+            messagebox.showinfo("자산분배 추이", "히스토리가 없습니다. 먼저 '계산 및 차트/수익률 보기'를 실행하세요.", parent=self.chart_win)
+            return
+        has_alloc = False
+        for rec in hist.values():
+            a = (rec or {}).get("allocation")
+            if isinstance(a, dict) and a:
+                has_alloc = True
+                break
+        if not has_alloc:
+            messagebox.showinfo(
+                "자산분배 추이",
+                "저장된 히스토리에 자산군(allocation) 항목이 없습니다. 최신 앱으로 기록이 쌓인 뒤 다시 시도하세요.",
+                parent=self.chart_win,
+            )
+            return
+        menu = tk.Toplevel(self.chart_win)
+        menu.title("자산분배 추이")
+        menu.configure(bg=self.CARD_BG)
+        self.bind_escape_to_close(menu)
+        try:
+            menu.attributes("-alpha", self.current_alpha)
+            menu.after(100, lambda: menu.attributes("-alpha", self.current_alpha))
+        except Exception:
+            pass
+        tk.Label(
+            menu,
+            text="보기 모드를 선택하세요. 각 버튼은 새 창에 표로 열립니다.",
+            bg=self.CARD_BG,
+            fg=self.FG,
+            font=self.FONT_MAIN,
+            wraplength=400,
+        ).pack(pady=(12, 8), padx=14)
+        btn_fr = tk.Frame(menu, bg=self.CARD_BG)
+        btn_fr.pack(fill="x", padx=14, pady=(0, 14))
+        modes = [
+            ("일별 자산군", "일간"),
+            ("주별 자산군", "주간"),
+            ("월별 자산군", "월간"),
+            ("분기별 자산군", "분기"),
+        ]
+        for label, key in modes:
+            self._make_button(
+                btn_fr,
+                label,
+                lambda k=key: self.show_allocation_table_popup(k),
+                bg=self.BTN_BG,
+                fg=self.FG,
+                bold=True,
+            ).pack(fill="x", pady=3)
+        menu.update_idletasks()
+        w = max(menu.winfo_reqwidth(), 360)
+        h = menu.winfo_reqheight()
+        self._resize_and_place_chart_win(menu, desired_w=int(w) + 40, desired_h=int(h) + 40, reserve_bottom=0)
+
+    def _format_alloc_pct_with_amount(self, pct, amt) -> str:
+        """한 셀에 '비중% (금액원)' 형식. 누락은 —."""
+        ptxt = "—"
+        atxt = "—"
+        try:
+            if pct is not None and not pd.isna(pct):
+                ptxt = f"{float(pct):.2f}%"
+        except (TypeError, ValueError):
+            pass
+        try:
+            if amt is not None and not pd.isna(amt):
+                atxt = f"{int(round(float(amt))):,}원"
+        except (TypeError, ValueError):
+            pass
+        if ptxt == "—" and atxt == "—":
+            return "—"
+        return f"{ptxt} ({atxt})"
+
+    def show_allocation_table_popup(self, view_mode: str) -> None:
+        """view_mode: 일간 | 주간 | 월간 | 분기 — 자산군 amount·percent 표."""
+        if not (self.chart_win and self.chart_win.winfo_exists()):
+            return
+        df, categories = self._allocation_history_dataframe()
+        if df is None or not categories:
+            messagebox.showinfo("자산분배 표", "표시할 allocation 데이터가 없습니다.", parent=self.chart_win)
+            return
+        df = self._aggregate_allocation_dataframe(df, view_mode)
+        if df is None or df.empty:
+            messagebox.showinfo("자산분배 표", "집계 결과가 없습니다(영업일·기록 범위를 확인하세요).", parent=self.chart_win)
+            return
+        titles = {
+            "일간": "일별 자산군 · 비중% (금액)",
+            "주간": "주별 자산군 · 비중% (금액)",
+            "월간": "월별 자산군 · 비중% (금액)",
+            "분기": "분기별 자산군 · 비중% (금액)",
+        }
+        win = tk.Toplevel(self.chart_win)
+        win.title(titles.get(view_mode, "자산군"))
+        win.configure(bg=self.BG)
+        self.bind_escape_to_close(win)
+        try:
+            win.attributes("-alpha", self.current_alpha)
+            win.after(100, lambda: win.attributes("-alpha", self.current_alpha))
+        except Exception:
+            pass
+        # 컬럼: 날짜 + 자산별 한 열(비중% (금액))
+        col_ids = ["c_date"]
+        for c in categories:
+            col_ids.append(f"alloc__{c}")
+        st = ttk.Style()
+        try:
+            st.theme_use("clam")
+        except Exception:
+            pass
+        st.configure(
+            "AllocTable.Treeview",
+            background=self.ENTRY_BG,
+            fieldbackground=self.ENTRY_BG,
+            foreground=self.FG,
+            bordercolor=self.BORDER,
+        )
+        st.configure("AllocTable.Treeview.Heading", background=self.BTN_BG, foreground=self.FG, relief="flat")
+        st.map("AllocTable.Treeview.Heading", background=[("active", self.BTN_BG)])
+        outer = tk.Frame(win, bg=self.BG, padx=8, pady=8)
+        outer.pack(fill="both", expand=True)
+        yscroll = ttk.Scrollbar(outer, orient="vertical")
+        yscroll.pack(side="right", fill="y")
+        xscroll = ttk.Scrollbar(outer, orient="horizontal")
+        xscroll.pack(side="bottom", fill="x")
+        tree = ttk.Treeview(
+            outer,
+            columns=col_ids,
+            show="headings",
+            yscrollcommand=yscroll.set,
+            xscrollcommand=xscroll.set,
+            style="AllocTable.Treeview",
+            height=24,
+        )
+        tree.pack(side="left", fill="both", expand=True)
+        yscroll.config(command=tree.yview)
+        xscroll.config(command=tree.xview)
+        w_date = 200
+        w_combined = 200
+        tree.column("c_date", width=w_date, minwidth=120, stretch=False, anchor="center")
+        tree.heading("c_date", text="날짜(기간 말)")
+        for c in categories:
+            cid = f"alloc__{c}"
+            tree.column(cid, width=w_combined, minwidth=140, stretch=False, anchor="e")
+            tree.heading(cid, text=c)
+        for i, ts in enumerate(df.index):
+            dstr = _date_with_weekday_kr(ts)
+            vals = [dstr]
+            row = df.iloc[i]
+            for cat in categories:
+                av = row.get(f"__amt__{cat}", float("nan"))
+                pv = row.get(f"__pct__{cat}", float("nan"))
+                vals.append(self._format_alloc_pct_with_amount(pv, av))
+            tree.insert("", "end", values=vals)
+        win.minsize(600, 400)
+        win.geometry("1000x520")
+        win.update_idletasks()
+        # chart 근처에 배치
+        self._resize_and_place_chart_win(win, desired_w=1000, desired_h=520, reserve_bottom=0)
 
     def show_pie_popup(self):
         pie_win = tk.Toplevel(self.root)
