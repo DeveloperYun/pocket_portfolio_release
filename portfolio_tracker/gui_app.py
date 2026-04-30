@@ -2777,7 +2777,21 @@ class PortfolioApp:
                             v_krw = p_krw
 
                     roi = ((v_krw - p_krw) / p_krw * 100) if p_krw > 0 else 0
-                    report_data.append({'name': name, 'account': acc_name, 'is_fixed': True, 'roi': roi, 'prof': v_krw - p_krw, 'val': v_krw, 'prin': p_krw})
+                    cur_unit = (v_krw / qty) if qty > 0 else 0.0
+                    report_data.append(
+                        {
+                            'name': name,
+                            'account': acc_name,
+                            'is_fixed': True,
+                            'qty': qty,
+                            'cur_p': cur_unit,
+                            'avg_p': avg_price,
+                            'roi': roi,
+                            'prof': v_krw - p_krw,
+                            'val': v_krw,
+                            'prin': p_krw,
+                        }
+                    )
 
                     cat = get_asset_category(name, "")
                     asset_values[name] += v_krw
@@ -3795,6 +3809,15 @@ class PortfolioApp:
                 txt.insert(tk.END, "\n")
             elif d.get('is_fixed'):
                 txt.insert(tk.END, f"▶ {d['name']} [{d['account']}]\n")
+                qf = d.get('qty')
+                if qf is not None and float(qf) > 0:
+                    txt.insert(tk.END, f"  - 보유 수량: {float(qf):,.4f}\n")
+                cup = float(d.get('cur_p', 0) or 0)
+                if cup > 0:
+                    txt.insert(tk.END, f"  - 현재 가격: {cup:,.2f}원 (1단위당)\n")
+                avgp = float(d.get('avg_p', 0) or 0)
+                if avgp > 0:
+                    txt.insert(tk.END, f"  - 평단: {avgp:,.2f}원\n")
                 txt.insert(tk.END, f"  - 총 평가액: {int(d['val']):,}원 / 매수액: {int(d['prin']):,}원 (")
                 txt.insert(tk.END, f"{sign}{d['roi']:.2f}%\n", tag)
                 txt.insert(tk.END, "  - 손익금: ")
@@ -3805,8 +3828,9 @@ class PortfolioApp:
                 txt.insert(tk.END, f"▶ {d['name']} [{d['account']}]\n")
                 if qty is not None:
                     txt.insert(tk.END, f"  - 보유 수량: {qty:,.4f}\n")
-                txt.insert(tk.END, f"  - 평단 {d['avg_p']:,.2f}{unit} → 현재 {d['cur_p']:,.2f}{unit} (")
-                txt.insert(tk.END, f"{sign}{d['roi']:.2f}%\n", tag)
+                txt.insert(tk.END, f"  - 현재 가격: {d['cur_p']:,.2f}{unit}\n")
+                txt.insert(tk.END, f"  - 평단: {d['avg_p']:,.2f}{unit} (")
+                txt.insert(tk.END, f"수익률 {sign}{d['roi']:.2f}%\n", tag)
                 txt.insert(tk.END, f"  - 평가액: {int(d['val']):,}원 / 매수액: {int(d['prin']):,}원\n")
                 txt.insert(tk.END, "  - 손익금: ")
                 txt.insert(tk.END, f"{sign}{int(d['prof']):,}원\n\n", tag)
