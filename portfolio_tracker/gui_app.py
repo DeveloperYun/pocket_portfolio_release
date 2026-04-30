@@ -3688,7 +3688,17 @@ class PortfolioApp:
             def _roi_tip(i):
                 r = float(rois.iloc[i])
                 sign = "+" if r >= 0 else ""
-                return f"{_date_with_weekday_kr(dates[i])}\n원금 대비 수익률: {sign}{r:.2f}%"
+                prof = float(vals.iloc[i]) - float(prins.iloc[i])
+                if math.isfinite(prof):
+                    ps = "+" if prof >= 0 else ""
+                    prof_line = f"{ps}{int(round(prof)):,}원"
+                else:
+                    prof_line = "N/A"
+                return (
+                    f"{_date_with_weekday_kr(dates[i])}\n"
+                    f"원금 대비 수익률: {sign}{r:.2f}%\n"
+                    f"원금 대비 수익: {prof_line}"
+                )
 
             def _pure_tip(i):
                 r = float(pure_day_returns.iloc[i])
