@@ -3796,8 +3796,8 @@ class PortfolioApp:
                 txt.insert(tk.END, f"▶ {d['name']} [{d['account']}]\n")
                 cash_tag = "up" if d['roi'] > 0 else ("down" if d['roi'] < 0 else "flat")
                 cash_sign = "+" if d['roi'] > 0 else ""
-                txt.insert(tk.END, f"  - 예수금(원화 환산 평가): {int(d['val']):,}원 / 원가: {int(d['prin']):,}원 (")
-                txt.insert(tk.END, f"{cash_sign}{d['roi']:.2f}%\n", cash_tag)
+                txt.insert(tk.END, f"  - 예수금(원화 환산 평가): {int(d['val']):,}원  ·  원가: {int(d['prin']):,}원  ·  ")
+                txt.insert(tk.END, f"수익률 {cash_sign}{d['roi']:.2f}%\n", cash_tag)
                 txt.insert(tk.END, "  - 손익금: ")
                 txt.insert(tk.END, f"{cash_sign}{int(d['prof']):,}원\n", cash_tag)
                 if d.get('is_usd_cash'):
@@ -3818,8 +3818,8 @@ class PortfolioApp:
                 avgp = float(d.get('avg_p', 0) or 0)
                 if avgp > 0:
                     txt.insert(tk.END, f"  - 평단: {avgp:,.2f}원\n")
-                txt.insert(tk.END, f"  - 총 평가액: {int(d['val']):,}원 / 매수액: {int(d['prin']):,}원 (")
-                txt.insert(tk.END, f"{sign}{d['roi']:.2f}%\n", tag)
+                txt.insert(tk.END, f"  - 총 평가액: {int(d['val']):,}원  ·  매수액: {int(d['prin']):,}원  ·  ")
+                txt.insert(tk.END, f"수익률 {sign}{d['roi']:.2f}%\n", tag)
                 txt.insert(tk.END, "  - 손익금: ")
                 txt.insert(tk.END, f"{sign}{int(d['prof']):,}원\n\n", tag)
             else:
@@ -3829,9 +3829,9 @@ class PortfolioApp:
                 if qty is not None:
                     txt.insert(tk.END, f"  - 보유 수량: {qty:,.4f}\n")
                 txt.insert(tk.END, f"  - 현재 가격: {d['cur_p']:,.2f}{unit}\n")
-                txt.insert(tk.END, f"  - 평단: {d['avg_p']:,.2f}{unit} (")
+                txt.insert(tk.END, f"  - 평단: {d['avg_p']:,.2f}{unit}  ·  ")
                 txt.insert(tk.END, f"수익률 {sign}{d['roi']:.2f}%\n", tag)
-                txt.insert(tk.END, f"  - 평가액: {int(d['val']):,}원 / 매수액: {int(d['prin']):,}원\n")
+                txt.insert(tk.END, f"  - 평가액: {int(d['val']):,}원  ·  매수액: {int(d['prin']):,}원\n")
                 txt.insert(tk.END, "  - 손익금: ")
                 txt.insert(tk.END, f"{sign}{int(d['prof']):,}원\n\n", tag)
                 if d.get('is_us'):
