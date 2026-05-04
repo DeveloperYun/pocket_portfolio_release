@@ -2426,7 +2426,7 @@ class PortfolioApp:
         try:
             return float(yf.Ticker("KRW=X").history(period="1d")['Close'].iloc[-1])
         except Exception:
-            return 1400.0
+            return 1471.0
 
     def get_kr_price(self, code):
         try:
