@@ -40,9 +40,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller pillow requests beautifulsoup4 yfinance pandas numpy matplotlib holidays
 
+      # Windows GitHub 빌드 산출물만 gui_app에서 초기 투명도 100%로 인식하도록 마커를 번들에 넣는다.
       - name: Build (onefile)
+        shell: bash
+        env:
+          APP_VERSION: ${{ env.APP_VERSION }}
         run: |
-          pyinstaller --noconfirm --clean --noconsole --onefile --name "portfolio-tracker-${{ env.APP_VERSION }}" --hidden-import PIL.ImageTk --hidden-import PIL._imagingtk --hidden-import matplotlib.backends.backend_tkagg --hidden-import matplotlib.backends._backend_tk run_app.py
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            printf '\n' > _ci_release_build.marker
+            pyinstaller --noconfirm --clean --noconsole --onefile \
+              --name "portfolio-tracker-${APP_VERSION}" \
+              --hidden-import PIL.ImageTk \
+              --hidden-import PIL._imagingtk \
+              --hidden-import matplotlib.backends.backend_tkagg \
+              --hidden-import matplotlib.backends._backend_tk \
+              --add-data "_ci_release_build.marker;." \
+              run_app.py
+          else
+            pyinstaller --noconfirm --clean --noconsole --onefile \
+              --name "portfolio-tracker-${APP_VERSION}" \
+              --hidden-import PIL.ImageTk \
+              --hidden-import PIL._imagingtk \
+              --hidden-import matplotlib.backends.backend_tkagg \
+              --hidden-import matplotlib.backends._backend_tk \
+              run_app.py
+          fi
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
