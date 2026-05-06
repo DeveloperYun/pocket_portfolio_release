@@ -91,6 +91,25 @@ if TYPE_CHECKING:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: F401
     from matplotlib.ticker import FuncFormatter  # noqa: F401
 
+_CI_RELEASE_MARKER = "_ci_release_build.marker"
+
+
+def _default_window_alpha() -> float:
+    """
+    GitHub Actions Windows onefile 빌드에서만 번들에 포함되는 마커가 있으면
+    창 불투명도를 1.0(투명도 슬라이더 100%)으로 시작한다.
+    로컬/리눅스/마커 없는 Windows 빌드는 기존 기본값과 동일하다.
+    """
+    if current_os != "Windows" or not getattr(sys, "frozen", False):
+        return 0.1
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass and os.path.isfile(os.path.join(meipass, _CI_RELEASE_MARKER)):
+        return 1.0
+    exe_dir = os.path.dirname(getattr(sys, "executable", "") or "")
+    if exe_dir and os.path.isfile(os.path.join(exe_dir, _CI_RELEASE_MARKER)):
+        return 1.0
+    return 0.1
+
 
 class PortfolioApp:
     def __init__(self, root):
@@ -122,7 +141,7 @@ class PortfolioApp:
         # 마지막으로 불러온/저장한 포트폴리오 JSON 경로(덮어쓰기 저장에 사용)
         self.portfolio_json_path: str | None = None
 
-        self.current_alpha = 0.1
+        self.current_alpha = _default_window_alpha()
         self.chart_win = None
         self.chart_auto_refresh_job = None
         self.chart_auto_refresh_interval_ms = 30000
@@ -2426,7 +2445,7 @@ class PortfolioApp:
         try:
             return float(yf.Ticker("KRW=X").history(period="1d")['Close'].iloc[-1])
         except Exception:
-            return 1471.0
+            return 1400.0
 
     def get_kr_price(self, code):
         try:
