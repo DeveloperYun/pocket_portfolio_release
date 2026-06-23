@@ -2445,7 +2445,7 @@ class PortfolioApp:
         try:
             return float(yf.Ticker("KRW=X").history(period="1d")['Close'].iloc[-1])
         except Exception:
-            return 1400.0
+            return 1420.0
 
     def get_kr_price(self, code):
         try:
@@ -2946,7 +2946,15 @@ class PortfolioApp:
                 bg="#3D5A80",
                 fg="white",
                 bold=True,
-            ).pack(side='left', fill='x', expand=True)
+            ).pack(side='left', fill='x', expand=True, padx=(0, 2))
+            self._make_button(
+                alloc_trend_frame,
+                "🏦 계좌별 자산배분",
+                self.show_account_allocation_popup,
+                bg="#6A4C93",
+                fg="white",
+                bold=True,
+            ).pack(side='left', fill='x', expand=True, padx=(2, 0))
 
             btn_frame = tk.Frame(left_frame, bg=self.CARD_BG)
             btn_frame.pack(side='top', fill='x', pady=5, padx=10)
@@ -3088,6 +3096,231 @@ class PortfolioApp:
             txt.insert(tk.END, "\n")
 
         txt.config(state='disabled')
+
+    def _compute_account_macro_alloc(self) -> dict[str, dict[str, float]]:
+        """계좌별 자산군(주식·채권·금·원자재·현금성 자산) 평가금액."""
+        categories = ("주식", "채권", "금", "원자재", "현금성 자산")
+        result: dict[str, dict[str, float]] = defaultdict(lambda: {c: 0.0 for c in categories})
+        for d in getattr(self, "current_report_data", []) or []:
+            acc = str(d.get("account", "")).strip() or "일반 계좌"
+            val = float(d.get("val", 0) or 0)
+            if val <= 0:
+                continue
+            if d.get("is_pure_cash"):
+                cat = "현금성 자산"
+            elif d.get("is_fixed"):
+                cat = get_asset_category(d.get("name", ""), "")
+            else:
+                cat = get_asset_category(d.get("name", ""), str(d.get("ticker", "")).strip())
+            result[acc][cat] += val
+        return {k: dict(v) for k, v in result.items()}
+
+    def _format_account_macro_category_breakdown(self, account: str, category: str) -> str:
+        """선택 계좌·자산군에 포함된 예수금·종목과 평가금액."""
+        account = str(account).strip() or "일반 계좌"
+        rows = []
+        account_alloc = self._compute_account_macro_alloc()
+        total_cat = float(account_alloc.get(account, {}).get(category, 0.0))
+        ex = float(getattr(self, "current_exchange_rate", 1400.0))
+        cash_krw_total = 0.0
+        cash_usd_total = 0.0
+        cash_usd_val_krw_total = 0.0
+
+        if category == "현금성 자산":
+            for ent in self.account_cash:
+                acc = str(ent.get("account", "")).strip() or "일반 계좌"
+                if acc != account:
+                    continue
+                ck = float(ent.get("cash_krw", 0) or 0)
+                cu = float(ent.get("cash_usd", 0) or 0)
+                cash_krw_total += ck
+                cash_usd_total += cu
+                cash_usd_val_krw_total += (cu * ex)
+                if ck > 0:
+                    rows.append((f"예수금 (KRW)", ck))
+                if cu > 0:
+                    rows.append((f"예수금 (USD→원화)", cu * ex))
+
+        for d in getattr(self, "current_report_data", []) or []:
+            acc = str(d.get("account", "")).strip() or "일반 계좌"
+            if acc != account:
+                continue
+            name = d.get("name", "")
+            if d.get("is_fixed"):
+                cat = get_asset_category(name, "")
+            elif d.get("is_pure_cash"):
+                cat = "현금성 자산"
+            else:
+                ticker = str(d.get("ticker", "")).strip()
+                cat = get_asset_category(name, ticker)
+            if cat != category:
+                continue
+            val = float(d.get("val", 0))
+            if d.get("is_fixed"):
+                desc = f"{name} [실물/고정]"
+            elif d.get("is_pure_cash"):
+                desc = d.get("name", "예수금")
+            else:
+                ticker = str(d.get("ticker", "")).strip()
+                desc = f"{name} ({ticker})" if ticker else name
+                if category == "현금성 자산" and d.get("is_us"):
+                    qty = float(d.get("qty", 0) or 0)
+                    cur_p = float(d.get("cur_p", 0) or 0)
+                    usd_amt = qty * cur_p
+                    if usd_amt > 0:
+                        cash_usd_total += usd_amt
+                        cash_usd_val_krw_total += val
+                elif category == "현금성 자산":
+                    cash_krw_total += val
+            rows.append((desc, val))
+
+        rows.sort(key=lambda x: -x[1])
+        lines = [f"【{account} · {category}】 포함 종목 · 평가금액", "=" * 40, ""]
+        if category == "현금성 자산":
+            lines.append(f"원화 자산 합계: {int(round(cash_krw_total)):,}원")
+            lines.append(f"외화 자산 합계: {cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)")
+            lines.append("")
+        if not rows:
+            lines.append("(해당 자산군에 표시할 항목이 없습니다.)")
+        else:
+            for desc, val in rows:
+                pct = (val / total_cat * 100) if total_cat > 0 else 0.0
+                lines.append(f"• {desc}")
+                lines.append(f"    {int(val):,}원 ({pct:.1f}%)")
+            lines.append("")
+            lines.append(f"합계 (자산군): {int(round(total_cat)):,}원")
+        return "\n".join(lines)
+
+    def show_account_allocation_popup(self):
+        if not hasattr(self, "current_report_data") or not self.current_report_data:
+            parent = self.chart_win if (self.chart_win and self.chart_win.winfo_exists()) else self.root
+            messagebox.showinfo("계좌별 자산배분", "먼저 '계산 및 차트/수익률 보기'를 실행하세요.", parent=parent)
+            return
+
+        account_alloc = self._compute_account_macro_alloc()
+        if not account_alloc:
+            parent = self.chart_win if (self.chart_win and self.chart_win.winfo_exists()) else self.root
+            messagebox.showinfo("계좌별 자산배분", "표시할 계좌 데이터가 없습니다.", parent=parent)
+            return
+
+        pie_win = tk.Toplevel(self.root)
+        pie_win.title("계좌별 자산배분 현황")
+        pie_win.geometry("520x580")
+        pie_win.configure(bg=self.BG)
+        self.bind_escape_to_close(pie_win)
+        try:
+            pie_win.attributes('-alpha', self.current_alpha)
+            pie_win.after(100, lambda: pie_win.attributes('-alpha', self.current_alpha))
+        except Exception:
+            pass
+
+        top = tk.Frame(pie_win, bg=self.BG)
+        top.pack(fill='x', padx=10, pady=(10, 0))
+        tk.Label(top, text="계좌 선택:", bg=self.BG, fg=self.FG, font=self.FONT_MAIN).pack(side='left')
+        accounts = sorted(account_alloc.keys(), key=lambda a: -sum(account_alloc[a].values()))
+        ent_acc = ttk.Combobox(
+            top,
+            values=accounts,
+            state="readonly",
+            font=self.FONT_MAIN,
+            style="Modern.TCombobox",
+        )
+        ent_acc.set(accounts[0])
+        ent_acc.pack(side='left', fill='x', expand=True, padx=8)
+
+        self.lbl_account_alloc_summary = tk.Label(top, text="", bg=self.BG, fg=self.MUTED, font=self.FONT_CAPTION)
+        self.lbl_account_alloc_summary.pack(side='right')
+
+        pie_frame = tk.Frame(pie_win, bg=self.BG)
+        pie_frame.pack(fill='both', expand=True)
+
+        color_map = {
+            "주식": "#FF6B6B",
+            "채권": "#4D96FF",
+            "현금성 자산": "#4CAF50",
+            "금": "#FFD700",
+            "원자재": "#B08D57",
+        }
+
+        from matplotlib.figure import Figure
+
+        def draw_pie(account: str) -> None:
+            for child in pie_frame.winfo_children():
+                child.destroy()
+
+            macro = account_alloc.get(account, {})
+            total_val = sum(macro.values())
+            if self.lbl_account_alloc_summary.winfo_exists():
+                self.lbl_account_alloc_summary.config(text=f"총 평가금: {int(round(total_val)):,}원")
+
+            fig_pie = Figure(figsize=(5, 5))
+            fig_pie.patch.set_facecolor(self.BG)
+            ax_pie = fig_pie.add_subplot(111)
+            ax_pie.set_facecolor(self.BG)
+
+            labels, sizes, colors = [], [], []
+            for name, value in sorted(macro.items(), key=lambda x: x[1], reverse=True):
+                if value > 0:
+                    labels.append(name)
+                    sizes.append(value)
+                    colors.append(color_map.get(name, "#FFFFFF"))
+
+            if not sizes:
+                ax_pie.text(
+                    0.5,
+                    0.5,
+                    "표시할 자산이 없습니다.",
+                    color="white",
+                    ha="center",
+                    va="center",
+                    transform=ax_pie.transAxes,
+                    fontsize=13,
+                )
+                ax_pie.set_title(f"[{account}] 자산군 배분", color="white", fontsize=14, fontweight='bold', pad=15)
+            else:
+                wedges, texts, autotexts = ax_pie.pie(
+                    sizes,
+                    labels=labels,
+                    colors=colors,
+                    autopct='%1.1f%%',
+                    startangle=90,
+                    wedgeprops={'edgecolor': 'black', 'linewidth': 1.5},
+                )
+                for t in texts + autotexts:
+                    t.set_color('white')
+                    t.set_fontsize(11)
+                    t.set_fontweight('bold')
+                ax_pie.set_title(
+                    f"[{account}] 자산군 배분 (호버: 요약 · 클릭: 종목 구성)",
+                    color="white",
+                    fontsize=13,
+                    fontweight='bold',
+                    pad=15,
+                )
+
+                def on_macro_wedge_click(i):
+                    body = self._format_account_macro_category_breakdown(account, labels[i])
+                    self._show_pie_detail_popup(pie_win, f"[{account}] {labels[i]} — 포함 종목", body)
+
+                canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_frame)
+                canvas_pie.draw()
+                canvas_pie.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
+                self._setup_pie_hover(
+                    canvas_pie, fig_pie, ax_pie, wedges, labels, sizes, parent_win=pie_win, on_wedge_click=on_macro_wedge_click
+                )
+                return
+
+            canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_frame)
+            canvas_pie.draw()
+            canvas_pie.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
+
+        def on_account_change(_event=None):
+            acc = str(ent_acc.get()).strip()
+            if acc:
+                draw_pie(acc)
+
+        ent_acc.bind("<<ComboboxSelected>>", on_account_change)
+        draw_pie(accounts[0])
 
     def _ordered_allocation_categories(self) -> list:
         """히스토리에 등장한 자산군 키를 UI 일관된 순서로 정렬."""
@@ -3809,6 +4042,21 @@ class PortfolioApp:
             rows.append({"category": cat, "prin": prin, "val": val, "prof": prof, "roi": roi})
         return rows
 
+    def _total_prin_ex_cash_assets(self, report_data):
+        """예수금(is_pure_cash) 및 현금성 자산 분류 종목의 매수 원가를 제외한 투자 원가 합계."""
+        s = 0.0
+        for d in report_data:
+            if d.get("is_pure_cash"):
+                continue
+            if d.get("is_fixed"):
+                cat = get_asset_category(d.get("name", ""), "")
+            else:
+                cat = get_asset_category(d.get("name", ""), d.get("ticker", ""))
+            if cat == "현금성 자산":
+                continue
+            s += float(d.get("prin", 0) or 0)
+        return s
+
     def _fill_report_text(self, txt, report_data, total_prin, total_val, total_prof, total_roi, ex_rate):
         txt.config(state='normal')
         txt.delete("1.0", tk.END)
@@ -3880,6 +4128,8 @@ class PortfolioApp:
         txt.insert(tk.END, "=" * 45 + "\n")
         txt.insert(tk.END, "[ 전체 포트폴리오 요약 ]\n", "title")
         txt.insert(tk.END, f"▶ 총 매수 금액 : {int(total_prin):,}원\n")
+        invest_prin_ex_cash = self._total_prin_ex_cash_assets(report_data)
+        txt.insert(tk.END, f"▶ 예수금·현금성 자산 제외 투자금액 : {int(invest_prin_ex_cash):,}원\n")
         txt.insert(tk.END, f"▶ 총 평가 금액 : {int(total_val):,}원\n")
 
         macro_rows = self._macro_category_pnl_rows(report_data)
