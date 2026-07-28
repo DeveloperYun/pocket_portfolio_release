@@ -88,7 +88,12 @@ def count_kr_business_days_after_prev(
 
 
 def normalize_account_cash_entry(raw: Any) -> Optional[Dict[str, Any]]:
-    """JSON의 account_cash 항목을 정규화한다."""
+    """JSON의 account_cash 항목을 정규화한다.
+
+    엔화 원가:
+    - jpy_cost_krw: 환전 시 투입한 원화 총액(예수금 원가)
+    - jpy_buy_rate_per_100: 환전 평단(원/100엔). 있으면 cash_jpy로 원가를 계산한다.
+    """
     if not isinstance(raw, dict):
         return None
     acc = str(raw.get("account", "")).strip() or "일반 계좌"
@@ -104,9 +109,40 @@ def normalize_account_cash_entry(raw: Any) -> Optional[Dict[str, Any]]:
         usd_cost_krw = float(raw.get("usd_cost_krw", 0) or 0)
     except (TypeError, ValueError):
         usd_cost_krw = 0.0
-    if ck == 0 and cu == 0:
+    try:
+        cj = float(raw.get("cash_jpy", 0) or 0)
+    except (TypeError, ValueError):
+        cj = 0.0
+    try:
+        jpy_cost_krw = float(raw.get("jpy_cost_krw", 0) or 0)
+    except (TypeError, ValueError):
+        jpy_cost_krw = 0.0
+    try:
+        jpy_buy_rate_per_100 = float(raw.get("jpy_buy_rate_per_100", 0) or 0)
+    except (TypeError, ValueError):
+        jpy_buy_rate_per_100 = 0.0
+
+    # 환율(원/100엔)이 있으면 예수금 원가 = 엔화수량 × (원/100엔) / 100
+    if cj > 0 and jpy_buy_rate_per_100 > 0:
+        jpy_cost_krw = cj * jpy_buy_rate_per_100 / 100.0
+    # 예전 오입력 호환: jpy_cost_krw에 원/100엔 환율만 넣은 경우(원가 총액이 아님)
+    elif cj > 100 and 100 < jpy_cost_krw < 2000:
+        jpy_buy_rate_per_100 = jpy_cost_krw
+        jpy_cost_krw = cj * jpy_buy_rate_per_100 / 100.0
+
+    if ck == 0 and cu == 0 and cj == 0:
         return None
-    return {"account": acc, "cash_krw": ck, "cash_usd": cu, "usd_cost_krw": usd_cost_krw}
+    out = {
+        "account": acc,
+        "cash_krw": ck,
+        "cash_usd": cu,
+        "usd_cost_krw": usd_cost_krw,
+        "cash_jpy": cj,
+        "jpy_cost_krw": jpy_cost_krw,
+    }
+    if jpy_buy_rate_per_100 > 0:
+        out["jpy_buy_rate_per_100"] = jpy_buy_rate_per_100
+    return out
 
 
 def get_user_data_dir() -> str:
