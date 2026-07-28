@@ -134,7 +134,10 @@ class PortfolioApp:
         self._setup_styles()
 
         self.portfolio = []
-        # 계좌별 예수금: [{"account": str, "cash_krw": float, "cash_usd": float}, ...]
+        # 계좌별 예수금:
+        # [{"account": str, "cash_krw": float, "cash_usd": float, "usd_cost_krw": float,
+        #   "cash_jpy": float, "jpy_cost_krw": float}, ...]
+        # usd_cost_krw / jpy_cost_krw: 외화 예수금의 원화 원가(환전 환율 가중 누적) → 환차익/환손실 산정
         self.account_cash = []
         # 실현손익(매도) 기록(누적 저장): [{"sell_date": "...", "account": "...", ...}, ...]
         self.sell_records = self._load_sell_records_from_disk()
@@ -156,6 +159,7 @@ class PortfolioApp:
         self.report_text_widget = None
         self.current_report_data = []
         self.current_exchange_rate = 1400.0
+        self.current_jpy_exchange_rate = 9.5
         self.rebalance_enabled = tk.BooleanVar(value=False)
         self.target_ratios = {"주식": 20.0, "채권": 20.0, "금": 20.0, "원자재": 20.0, "현금성 자산": 20.0}
 
@@ -519,6 +523,34 @@ class PortfolioApp:
         self.ent_usd = self._make_entry(frame_cash)
         self.ent_usd.grid(row=1, column=1, pady=5, padx=(10, 0), sticky="ew")
 
+        self._make_label(frame_cash, "환전 환율(KRW/USD)").grid(row=2, column=0, sticky='w')
+        self.ent_usd_ex = self._make_entry(frame_cash)
+        self.ent_usd_ex.grid(row=2, column=1, pady=5, padx=(10, 0), sticky="ew")
+        try:
+            self.ent_usd_ex.insert(0, f"{float(getattr(self, 'current_exchange_rate', 1400.0)):.2f}")
+        except Exception:
+            self.ent_usd_ex.insert(0, "1400.00")
+
+        self._make_label(frame_cash, "엔화 예수금(JPY)").grid(row=3, column=0, sticky='w')
+        self.ent_jpy = self._make_entry(frame_cash)
+        self.ent_jpy.grid(row=3, column=1, pady=5, padx=(10, 0), sticky="ew")
+
+        self._make_label(frame_cash, "환전 환율(원/100엔)").grid(row=4, column=0, sticky='w')
+        self.ent_jpy_ex = self._make_entry(frame_cash)
+        self.ent_jpy_ex.grid(row=4, column=1, pady=5, padx=(10, 0), sticky="ew")
+        try:
+            jpy_per_100 = float(getattr(self, "current_jpy_exchange_rate", 9.5)) * 100.0
+            self.ent_jpy_ex.insert(0, f"{jpy_per_100:.2f}")
+        except Exception:
+            self.ent_jpy_ex.insert(0, "950.00")
+        tk.Label(
+            frame_cash,
+            text="외화 추가 시에만 사용. 환전 환율로 예수금 원가를 쌓고, 현재 환율과의 차이만 환차익/환차손으로 반영합니다.",
+            bg=self.CARD_BG,
+            fg=self.MUTED,
+            font=self.FONT_CAPTION,
+        ).grid(row=5, column=0, columnspan=2, sticky='w')
+
         self._make_button(
             frame_cash,
             text="현금 자산 추가하기",
@@ -526,14 +558,14 @@ class PortfolioApp:
             bg=self.ACCENT_ALT,
             fg="#0D1117",
             bold=True
-        ).grid(row=2, column=0, columnspan=2, pady=(10, 4), sticky="ew")
+        ).grid(row=6, column=0, columnspan=2, pady=(10, 4), sticky="ew")
         tk.Label(
             frame_cash,
             text="(위「계좌명」칸의 계좌에 예수금이 반영됩니다)",
             bg=self.CARD_BG,
             fg=self.MUTED,
             font=self.FONT_CAPTION
-        ).grid(row=3, column=0, columnspan=2, sticky='w')
+        ).grid(row=7, column=0, columnspan=2, sticky='w')
 
         frame_hist = self._build_card_frame(self.main_content)
         frame_hist.pack(pady=6, fill="x", padx=20)
@@ -875,28 +907,39 @@ class PortfolioApp:
         rows = []
         total_cat = float(self.current_macro_alloc.get(category, 0.0))
         ex = float(getattr(self, "current_exchange_rate", 1400.0))
+        jpy_ex = float(getattr(self, "current_jpy_exchange_rate", 9.5))
         cash_krw_total = 0.0
         cash_usd_total = 0.0
         cash_usd_val_krw_total = 0.0
+        cash_jpy_total = 0.0
+        cash_jpy_val_krw_total = 0.0
         cash_krw_by_account = defaultdict(float)
         cash_usd_by_account = defaultdict(float)
+        cash_jpy_by_account = defaultdict(float)
 
         if category == "현금성 자산":
             for ent in self.account_cash:
                 acc = str(ent.get("account", "")).strip() or "일반 계좌"
                 ck = float(ent.get("cash_krw", 0) or 0)
                 cu = float(ent.get("cash_usd", 0) or 0)
+                cj = float(ent.get("cash_jpy", 0) or 0)
                 cash_krw_total += ck
                 cash_usd_total += cu
                 cash_usd_val_krw_total += (cu * ex)
+                cash_jpy_total += cj
+                cash_jpy_val_krw_total += (cj * jpy_ex)
                 if ck > 0:
                     cash_krw_by_account[acc] += ck
                 if cu > 0:
                     cash_usd_by_account[acc] += cu
+                if cj > 0:
+                    cash_jpy_by_account[acc] += cj
                 if ck > 0:
                     rows.append((f"예수금 (KRW) · {acc}", ck))
                 if cu > 0:
                     rows.append((f"예수금 (USD→원화) · {acc}", cu * ex))
+                if cj > 0:
+                    rows.append((f"예수금 (JPY→원화) · {acc}", cj * jpy_ex))
 
         for d in self.current_report_data:
             name = d.get("name", "")
@@ -933,15 +976,22 @@ class PortfolioApp:
         lines = [f"【{category}】 포함 종목 · 평가금액", "=" * 40, ""]
         if category == "현금성 자산":
             lines.append(f"원화 자산 합계: {int(round(cash_krw_total)):,}원")
-            lines.append(f"외화 자산 합계: {cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)")
+            fx_parts = [f"{cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)"]
+            if cash_jpy_total > 0:
+                fx_parts.append(f"{cash_jpy_total:,.0f} JPY (원화환산 {int(round(cash_jpy_val_krw_total)):,}원)")
+            lines.append("외화 자산 합계: " + " · ".join(fx_parts))
             if cash_krw_by_account:
                 lines.append("원화 현금(계좌별):")
                 for acc, amount in sorted(cash_krw_by_account.items(), key=lambda x: -x[1]):
                     lines.append(f"  - {acc}: {int(round(amount)):,}원")
             if cash_usd_by_account:
-                lines.append("외화 현금(계좌별):")
+                lines.append("달러 현금(계좌별):")
                 for acc, amount in sorted(cash_usd_by_account.items(), key=lambda x: -x[1]):
                     lines.append(f"  - {acc}: {amount:,.2f} USD (원화환산 {int(round(amount * ex)):,}원)")
+            if cash_jpy_by_account:
+                lines.append("엔화 현금(계좌별):")
+                for acc, amount in sorted(cash_jpy_by_account.items(), key=lambda x: -x[1]):
+                    lines.append(f"  - {acc}: {amount:,.0f} JPY (원화환산 {int(round(amount * jpy_ex)):,}원)")
             lines.append("")
         if not rows:
             lines.append("(해당 자산군에 표시할 항목이 없습니다.)")
@@ -1434,10 +1484,104 @@ class PortfolioApp:
                     row["cash_usd"] = 0.0
                 if "usd_cost_krw" not in row:
                     row["usd_cost_krw"] = 0.0
+                if "cash_jpy" not in row:
+                    row["cash_jpy"] = 0.0
+                if "jpy_cost_krw" not in row:
+                    row["jpy_cost_krw"] = 0.0
                 return row
-        row = {"account": acc, "cash_krw": 0.0, "cash_usd": 0.0, "usd_cost_krw": 0.0}
+        row = {
+            "account": acc,
+            "cash_krw": 0.0,
+            "cash_usd": 0.0,
+            "usd_cost_krw": 0.0,
+            "cash_jpy": 0.0,
+            "jpy_cost_krw": 0.0,
+        }
         self.account_cash.append(row)
         return row
+
+    def _avg_usd_cash_exchange_rate(self, cash_row: dict) -> float:
+        """달러 예수금의 가중평균 환전환율(KRW/USD). 원가 없으면 0."""
+        cu = float(cash_row.get("cash_usd", 0) or 0)
+        cost = float(cash_row.get("usd_cost_krw", 0) or 0)
+        if cu > 1e-12 and cost > 0:
+            return cost / cu
+        return 0.0
+
+    def _avg_jpy_cash_exchange_rate(self, cash_row: dict) -> float:
+        """엔화 예수금의 가중평균 환전환율(KRW/JPY, 1엔당). 원가 없으면 0."""
+        cj = float(cash_row.get("cash_jpy", 0) or 0)
+        cost = float(cash_row.get("jpy_cost_krw", 0) or 0)
+        if cj > 1e-12 and cost > 0:
+            return cost / cj
+        return 0.0
+
+    def _avg_jpy_cash_rate_per_100(self, cash_row: dict) -> float:
+        """엔화 예수금 환전 평단(원/100엔)."""
+        return self._avg_jpy_cash_exchange_rate(cash_row) * 100.0
+
+    def _add_usd_cash_with_cost(self, cash_row: dict, usd_amount: float, exchange_rate: float) -> None:
+        """달러 예수금 증가 + 원화 원가(usd_cost_krw) 누적."""
+        cash_row["cash_usd"] = float(cash_row.get("cash_usd", 0) or 0) + float(usd_amount)
+        cash_row["usd_cost_krw"] = float(cash_row.get("usd_cost_krw", 0) or 0) + (
+            float(usd_amount) * float(exchange_rate)
+        )
+
+    def _add_jpy_cash_with_cost(self, cash_row: dict, jpy_amount: float, rate_per_100: float) -> None:
+        """엔화 예수금 증가 + 원화 원가(jpy_cost_krw) 누적. rate_per_100: 원/100엔."""
+        rate_per_jpy = float(rate_per_100) / 100.0
+        cash_row["cash_jpy"] = float(cash_row.get("cash_jpy", 0) or 0) + float(jpy_amount)
+        cash_row["jpy_cost_krw"] = float(cash_row.get("jpy_cost_krw", 0) or 0) + (
+            float(jpy_amount) * rate_per_jpy
+        )
+        # 표시/저장용 평단(원/100엔)
+        avg100 = self._avg_jpy_cash_rate_per_100(cash_row)
+        if avg100 > 0:
+            cash_row["jpy_buy_rate_per_100"] = avg100
+
+    def _reduce_usd_cash_with_cost(self, cash_row: dict, usd_amount: float) -> None:
+        """달러 예수금 감소 시 보유 평균 원가 비율로 usd_cost_krw도 차감."""
+        old_usd = float(cash_row.get("cash_usd", 0) or 0)
+        old_cost = float(cash_row.get("usd_cost_krw", 0) or 0)
+        spend = float(usd_amount)
+        if old_usd > 1e-12 and old_cost > 0 and spend != 0:
+            cost_delta = old_cost * (spend / old_usd)
+        else:
+            cost_delta = 0.0
+        cash_row["cash_usd"] = old_usd - spend
+        cash_row["usd_cost_krw"] = max(0.0, old_cost - cost_delta)
+
+    def _reduce_jpy_cash_with_cost(self, cash_row: dict, jpy_amount: float) -> None:
+        """엔화 예수금 감소 시 보유 평균 원가 비율로 jpy_cost_krw도 차감."""
+        old_jpy = float(cash_row.get("cash_jpy", 0) or 0)
+        old_cost = float(cash_row.get("jpy_cost_krw", 0) or 0)
+        spend = float(jpy_amount)
+        if old_jpy > 1e-12 and old_cost > 0 and spend != 0:
+            cost_delta = old_cost * (spend / old_jpy)
+        else:
+            cost_delta = 0.0
+        cash_row["cash_jpy"] = old_jpy - spend
+        cash_row["jpy_cost_krw"] = max(0.0, old_cost - cost_delta)
+
+    def _format_cash_listbox_line(self, ent: dict) -> str:
+        acc = str(ent.get("account", "")).strip() or "일반 계좌"
+        ck = float(ent.get("cash_krw", 0) or 0)
+        cu = float(ent.get("cash_usd", 0) or 0)
+        cj = float(ent.get("cash_jpy", 0) or 0)
+        avg_usd_ex = self._avg_usd_cash_exchange_rate(ent)
+        avg_jpy_ex = self._avg_jpy_cash_exchange_rate(ent)
+        parts = [f"KRW {ck:,.0f}", f"USD {cu:,.2f}"]
+        if cj != 0 or avg_jpy_ex > 0:
+            parts.append(f"JPY {cj:,.0f}")
+        line = f"[예수금] {acc} | " + " / ".join(parts)
+        fx_bits = []
+        if cu > 0 and avg_usd_ex > 0:
+            fx_bits.append(f"USD평단 {avg_usd_ex:,.2f}")
+        if cj > 0 and avg_jpy_ex > 0:
+            fx_bits.append(f"JPY평단 {avg_jpy_ex * 100.0:,.2f}/100엔")
+        if fx_bits:
+            line += " (" + ", ".join(fx_bits) + ")"
+        return line
 
     def _round_avg_price(self, price: float, is_us: bool) -> float:
         # 추매 계산 시 과도한 소수 자릿수를 줄여 저장값을 안정화한다.
@@ -1616,7 +1760,7 @@ class PortfolioApp:
                         holding["qty"] = new_qty
                         holding["avg_price"] = self._round_avg_price(total_usd_cost / new_qty, is_us=True)
                         holding["buy_exchange_rate"] = (total_krw_cost / total_usd_cost) if total_usd_cost > 0 else buy_ex
-                        cash_row["cash_usd"] = float(cash_row.get("cash_usd", 0) or 0) - (qty * price)
+                        self._reduce_usd_cash_with_cost(cash_row, qty * price)
                         cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - buy_fee_krw
                     else:
                         holding["qty"] = new_qty
@@ -1640,7 +1784,7 @@ class PortfolioApp:
                             messagebox.showwarning("입력 오류", "미국 신규 종목은 매입 환율이 필요합니다.")
                             return
                         asset["buy_exchange_rate"] = buy_ex
-                        cash_row["cash_usd"] = float(cash_row.get("cash_usd", 0) or 0) - (qty * price)
+                        self._reduce_usd_cash_with_cost(cash_row, qty * price)
                         cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - buy_fee_krw
                     else:
                         cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - ((qty * price) + buy_fee_krw)
@@ -1825,7 +1969,7 @@ class PortfolioApp:
                 self.portfolio = apply_sell_to_portfolio(self.portfolio, rec)
                 cash_row = self._get_or_create_account_cash(account)
                 if is_us:
-                    cash_row["cash_usd"] = float(cash_row.get("cash_usd", 0) or 0) + (qty * price)
+                    self._add_usd_cash_with_cost(cash_row, qty * price, sell_ex)
                     cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) - sell_fee_krw
                 else:
                     cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) + (qty * price) - sell_fee_krw
@@ -1945,31 +2089,70 @@ class PortfolioApp:
             account = self.ent_account.get().strip() or "일반 계좌"
             krw_str = self.ent_krw.get().strip() or "0"
             usd_str = self.ent_usd.get().strip() or "0"
+            jpy_str = "0"
+            try:
+                jpy_str = self.ent_jpy.get().strip() or "0"
+            except Exception:
+                jpy_str = "0"
             krw = float(krw_str.replace(',', ''))
             usd = float(usd_str.replace(',', ''))
-            if krw == 0 and usd == 0:
+            jpy = float(jpy_str.replace(',', ''))
+            if krw == 0 and usd == 0 and jpy == 0:
                 return
-            ex = self.get_exchange_rate() if usd != 0 else 0.0
-            merged = None
-            for e in self.account_cash:
-                if e.get("account") == account:
-                    e["cash_krw"] = float(e.get("cash_krw", 0)) + krw
-                    e["cash_usd"] = float(e.get("cash_usd", 0)) + usd
-                    e["usd_cost_krw"] = float(e.get("usd_cost_krw", 0)) + (usd * ex)
-                    merged = e
-                    break
-            if merged is None:
-                merged = {"account": account, "cash_krw": krw, "cash_usd": usd, "usd_cost_krw": usd * ex}
-                self.account_cash.append(merged)
+            ex = 0.0
+            if usd != 0:
+                ex_str = ""
+                try:
+                    ex_str = self.ent_usd_ex.get().strip()
+                except Exception:
+                    ex_str = ""
+                if ex_str:
+                    ex = float(ex_str.replace(',', ''))
+                else:
+                    ex = float(self.get_exchange_rate())
+                if ex <= 0:
+                    messagebox.showwarning("입력 오류", "달러 예수금 추가 시 환전 환율(KRW/USD)이 필요합니다.")
+                    return
+            jpy_rate_per_100 = 0.0
+            if jpy != 0:
+                jpy_ex_str = ""
+                try:
+                    jpy_ex_str = self.ent_jpy_ex.get().strip()
+                except Exception:
+                    jpy_ex_str = ""
+                if jpy_ex_str:
+                    jpy_rate_per_100 = float(jpy_ex_str.replace(',', ''))
+                else:
+                    jpy_rate_per_100 = float(self.get_jpy_exchange_rate()) * 100.0
+                if jpy_rate_per_100 <= 0:
+                    messagebox.showwarning("입력 오류", "엔화 예수금 추가 시 환전 환율(원/100엔)이 필요합니다.")
+                    return
+            cash_row = self._get_or_create_account_cash(account)
+            cash_row["cash_krw"] = float(cash_row.get("cash_krw", 0) or 0) + krw
+            if usd != 0:
+                self._add_usd_cash_with_cost(cash_row, usd, ex)
+            if jpy != 0:
+                self._add_jpy_cash_with_cost(cash_row, jpy, jpy_rate_per_100)
             self.ent_krw.delete(0, tk.END)
             self.ent_usd.delete(0, tk.END)
-            self.listbox.insert(
-                tk.END,
-                f"[예수금] {account} | 누적 KRW {merged['cash_krw']:,.0f} / USD {merged['cash_usd']:,.2f}"
-            )
+            try:
+                self.ent_jpy.delete(0, tk.END)
+            except Exception:
+                pass
+            try:
+                self.ent_usd_ex.delete(0, tk.END)
+                self.ent_usd_ex.insert(0, f"{float(self.get_exchange_rate()):.2f}")
+            except Exception:
+                pass
+            try:
+                self.ent_jpy_ex.delete(0, tk.END)
+                self.ent_jpy_ex.insert(0, f"{float(self.get_jpy_exchange_rate()) * 100.0:.2f}")
+            except Exception:
+                pass
+            self.listbox.insert(tk.END, self._format_cash_listbox_line(cash_row))
             self.refresh_account_options(preferred_account=account)
-        except Exception:
-            pass
+        except Exception as e:
+            messagebox.showerror("예수금 추가 실패", f"예수금 반영 중 오류가 발생했습니다.\n\n{e}")
 
     def clear_all(self):
         self.portfolio.clear()
@@ -1988,13 +2171,23 @@ class PortfolioApp:
                 self.ent_ticker.delete(0, tk.END)
             except Exception:
                 pass
-        for ent in ("ent_name", "ent_qty", "ent_avg", "ent_krw", "ent_usd"):
+        for ent in ("ent_name", "ent_qty", "ent_avg", "ent_krw", "ent_usd", "ent_usd_ex", "ent_jpy", "ent_jpy_ex"):
             try:
                 w = getattr(self, ent, None)
                 if w is not None:
                     w.delete(0, tk.END)
             except Exception:
                 pass
+        try:
+            if hasattr(self, "ent_usd_ex"):
+                self.ent_usd_ex.insert(0, f"{float(getattr(self, 'current_exchange_rate', 1400.0)):.2f}")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "ent_jpy_ex"):
+                self.ent_jpy_ex.insert(0, f"{float(getattr(self, 'current_jpy_exchange_rate', 9.5)) * 100.0:.2f}")
+        except Exception:
+            pass
         try:
             if hasattr(self, "ent_buy_ex"):
                 self.ent_buy_ex.config(state="normal")
@@ -2095,7 +2288,10 @@ class PortfolioApp:
                 self.account_cash.append({
                     "account": "예수금 (레거시 통합)",
                     "cash_krw": legacy_krw,
-                    "cash_usd": legacy_usd
+                    "cash_usd": legacy_usd,
+                    "usd_cost_krw": 0.0,
+                    "cash_jpy": 0.0,
+                    "jpy_cost_krw": 0.0,
                 })
             self.rebalance_enabled.set(bool(data.get("rebalance_enabled", False)))
             loaded_ratios = self._load_target_ratios_from_json(data)
@@ -2103,10 +2299,7 @@ class PortfolioApp:
                 self.target_ratios[k] = v
             self.sync_rebalance_entries_from_config()
             for ent in self.account_cash:
-                acc = ent.get("account", "일반 계좌")
-                ck = float(ent.get("cash_krw", 0) or 0)
-                cu = float(ent.get("cash_usd", 0) or 0)
-                self.listbox.insert(tk.END, f"[예수금] {acc} | KRW {ck:,.0f} / USD {cu:,.2f}")
+                self.listbox.insert(tk.END, self._format_cash_listbox_line(ent))
             for item in self.portfolio:
                 account = item.get('account', '일반 계좌')
                 name = item.get('name', '')
@@ -2447,6 +2640,13 @@ class PortfolioApp:
         except Exception:
             return 1420.0
 
+    def get_jpy_exchange_rate(self):
+        """1 JPY당 KRW (Yahoo JPYKRW=X)."""
+        try:
+            return float(yf.Ticker("JPYKRW=X").history(period="1d")["Close"].iloc[-1])
+        except Exception:
+            return float(getattr(self, "current_jpy_exchange_rate", 9.5) or 9.5)
+
     def get_kr_price(self, code):
         try:
             res = requests.get(
@@ -2719,6 +2919,7 @@ class PortfolioApp:
             self.root.update()
 
             exchange_rate = self.get_exchange_rate()
+            jpy_exchange_rate = self.get_jpy_exchange_rate()
             asset_values = defaultdict(float)
             report_data = []
 
@@ -2730,12 +2931,17 @@ class PortfolioApp:
                 acc_name = str(ent.get("account", "")).strip() or "일반 계좌"
                 ck = float(ent.get("cash_krw", 0) or 0)
                 cu = float(ent.get("cash_usd", 0) or 0)
+                cj = float(ent.get("cash_jpy", 0) or 0)
                 usd_val_krw = cu * exchange_rate
+                jpy_val_krw = cj * jpy_exchange_rate
                 usd_cost_krw = float(ent.get("usd_cost_krw", 0) or 0)
+                jpy_cost_krw = float(ent.get("jpy_cost_krw", 0) or 0)
                 if cu > 0 and usd_cost_krw <= 0:
                     usd_cost_krw = usd_val_krw
-                line_prin = ck + usd_cost_krw
-                line_val = ck + usd_val_krw
+                if cj > 0 and jpy_cost_krw <= 0:
+                    jpy_cost_krw = jpy_val_krw
+                line_prin = ck + usd_cost_krw + jpy_cost_krw
+                line_val = ck + usd_val_krw + jpy_val_krw
                 if line_val <= 0:
                     continue
                 pure_cash_val += line_val
@@ -2747,19 +2953,34 @@ class PortfolioApp:
                     parts.append(f"KRW {ck:,.0f}")
                 if cu > 0:
                     parts.append(f"USD {cu:,.2f}")
+                if cj > 0:
+                    parts.append(f"JPY {cj:,.0f}")
                 cash_label = "예수금 (" + " · ".join(parts) + ")" if parts else "예수금"
+                usd_avg_ex = (usd_cost_krw / cu) if cu > 1e-12 and usd_cost_krw > 0 else 0.0
+                jpy_avg_ex = (jpy_cost_krw / cj) if cj > 1e-12 and jpy_cost_krw > 0 else 0.0
+                usd_fx_prof = usd_val_krw - usd_cost_krw
+                jpy_fx_prof = jpy_val_krw - jpy_cost_krw
                 report_data.append(
                     {
                         'name': cash_label,
                         'account': acc_name,
                         'is_pure_cash': True,
                         'is_usd_cash': cu > 0,
+                        'is_jpy_cash': cj > 0,
                         'cash_krw': ck,
                         'cash_usd': cu,
+                        'cash_jpy': cj,
                         'cash_usd_val_krw': usd_val_krw,
+                        'cash_jpy_val_krw': jpy_val_krw,
+                        'usd_cost_krw': usd_cost_krw,
+                        'jpy_cost_krw': jpy_cost_krw,
+                        'buy_exchange_rate': usd_avg_ex,
+                        'buy_jpy_exchange_rate': jpy_avg_ex,
                         'roi': ((line_val - line_prin) / line_prin * 100) if line_prin > 0 else 0.0,
                         'prof': line_val - line_prin,
-                        'fx_prof': usd_val_krw - usd_cost_krw,
+                        'fx_prof': usd_fx_prof + jpy_fx_prof,
+                        'fx_prof_usd': usd_fx_prof,
+                        'fx_prof_jpy': jpy_fx_prof,
                         'val': line_val,
                         'prin': line_prin,
                     }
@@ -2885,6 +3106,7 @@ class PortfolioApp:
 
             self.current_report_data = report_data
             self.current_exchange_rate = exchange_rate
+            self.current_jpy_exchange_rate = jpy_exchange_rate
 
             self.lbl_status.config(text="계산 완료! 통합 수익률 확인", fg="#00FF00")
             if in_place_refresh and self.chart_win and self.chart_win.winfo_exists():
@@ -3122,9 +3344,12 @@ class PortfolioApp:
         account_alloc = self._compute_account_macro_alloc()
         total_cat = float(account_alloc.get(account, {}).get(category, 0.0))
         ex = float(getattr(self, "current_exchange_rate", 1400.0))
+        jpy_ex = float(getattr(self, "current_jpy_exchange_rate", 9.5))
         cash_krw_total = 0.0
         cash_usd_total = 0.0
         cash_usd_val_krw_total = 0.0
+        cash_jpy_total = 0.0
+        cash_jpy_val_krw_total = 0.0
 
         if category == "현금성 자산":
             for ent in self.account_cash:
@@ -3133,13 +3358,18 @@ class PortfolioApp:
                     continue
                 ck = float(ent.get("cash_krw", 0) or 0)
                 cu = float(ent.get("cash_usd", 0) or 0)
+                cj = float(ent.get("cash_jpy", 0) or 0)
                 cash_krw_total += ck
                 cash_usd_total += cu
                 cash_usd_val_krw_total += (cu * ex)
+                cash_jpy_total += cj
+                cash_jpy_val_krw_total += (cj * jpy_ex)
                 if ck > 0:
                     rows.append((f"예수금 (KRW)", ck))
                 if cu > 0:
                     rows.append((f"예수금 (USD→원화)", cu * ex))
+                if cj > 0:
+                    rows.append((f"예수금 (JPY→원화)", cj * jpy_ex))
 
         for d in getattr(self, "current_report_data", []) or []:
             acc = str(d.get("account", "")).strip() or "일반 계좌"
@@ -3178,7 +3408,10 @@ class PortfolioApp:
         lines = [f"【{account} · {category}】 포함 종목 · 평가금액", "=" * 40, ""]
         if category == "현금성 자산":
             lines.append(f"원화 자산 합계: {int(round(cash_krw_total)):,}원")
-            lines.append(f"외화 자산 합계: {cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)")
+            fx_parts = [f"{cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)"]
+            if cash_jpy_total > 0:
+                fx_parts.append(f"{cash_jpy_total:,.0f} JPY (원화환산 {int(round(cash_jpy_val_krw_total)):,}원)")
+            lines.append("외화 자산 합계: " + " · ".join(fx_parts))
             lines.append("")
         if not rows:
             lines.append("(해당 자산군에 표시할 항목이 없습니다.)")
@@ -4062,7 +4295,11 @@ class PortfolioApp:
         txt.delete("1.0", tk.END)
         txt.insert(tk.END, "📊 포트폴리오 수익률 상세 보고서\n", "title")
         txt.insert(tk.END, "=" * 45 + "\n")
-        txt.insert(tk.END, f"적용 환율: 1 USD = {ex_rate:,.2f} KRW\n\n")
+        jpy_ex_rate = float(getattr(self, "current_jpy_exchange_rate", 9.5) or 9.5)
+        txt.insert(
+            tk.END,
+            f"적용 환율: 1 USD = {ex_rate:,.2f} KRW · 100 JPY = {jpy_ex_rate * 100.0:,.2f} KRW\n\n",
+        )
 
         txt.insert(tk.END, "[ 개별 종목 수익률 ]\n")
         for d in report_data:
@@ -4070,19 +4307,34 @@ class PortfolioApp:
             sign = "+" if d['roi'] > 0 else ""
 
             if d.get('is_pure_cash'):
+                # 예수금은 투자수익이 아님. 평가액은 자산, 손익은 환차익/환차손만.
                 txt.insert(tk.END, f"▶ {d['name']} [{d['account']}]\n")
-                cash_tag = "up" if d['roi'] > 0 else ("down" if d['roi'] < 0 else "flat")
-                cash_sign = "+" if d['roi'] > 0 else ""
-                txt.insert(tk.END, f"  - 예수금(원화 환산 평가): {int(d['val']):,}원  ·  원가: {int(d['prin']):,}원  ·  ")
-                txt.insert(tk.END, f"수익률 {cash_sign}{d['roi']:.2f}%\n", cash_tag)
-                txt.insert(tk.END, "  - 손익금: ")
-                txt.insert(tk.END, f"{cash_sign}{int(d['prof']):,}원\n", cash_tag)
+                txt.insert(
+                    tk.END,
+                    f"  - 예수금 평가액: {int(d['val']):,}원  ·  환전 원가: {int(d['prin']):,}원\n",
+                )
                 if d.get('is_usd_cash'):
-                    fx_prof = float(d.get('fx_prof', 0.0))
-                    fx_tag = "up" if fx_prof > 0 else ("down" if fx_prof < 0 else "flat")
-                    fx_sign = "+" if fx_prof > 0 else ""
-                    txt.insert(tk.END, "  - 환손익: ")
-                    txt.insert(tk.END, f"{fx_sign}{int(fx_prof):,}원\n", fx_tag)
+                    buy_ex = float(d.get('buy_exchange_rate', 0) or 0)
+                    if buy_ex > 0:
+                        txt.insert(tk.END, f"  - USD 환전 평단: 1 USD = {buy_ex:,.2f} KRW\n")
+                    usd_fx = float(d.get('fx_prof_usd', 0.0) or 0.0)
+                    if 'fx_prof_usd' not in d and not d.get('is_jpy_cash'):
+                        usd_fx = float(d.get('fx_prof', 0.0) or 0.0)
+                    fx_tag = "up" if usd_fx > 0 else ("down" if usd_fx < 0 else "flat")
+                    fx_sign = "+" if usd_fx > 0 else ""
+                    txt.insert(tk.END, "  - USD 환차익/환차손: ")
+                    txt.insert(tk.END, f"{fx_sign}{int(usd_fx):,}원\n", fx_tag)
+                if d.get('is_jpy_cash'):
+                    buy_jpy_ex = float(d.get('buy_jpy_exchange_rate', 0) or 0)
+                    if buy_jpy_ex > 0:
+                        txt.insert(tk.END, f"  - JPY 환전 평단: 100엔 = {buy_jpy_ex * 100.0:,.2f}원\n")
+                    jpy_fx = float(d.get('fx_prof_jpy', 0.0) or 0.0)
+                    fx_tag = "up" if jpy_fx > 0 else ("down" if jpy_fx < 0 else "flat")
+                    fx_sign = "+" if jpy_fx > 0 else ""
+                    txt.insert(tk.END, "  - JPY 환차익/환차손: ")
+                    txt.insert(tk.END, f"{fx_sign}{int(jpy_fx):,}원\n", fx_tag)
+                if not d.get('is_usd_cash') and not d.get('is_jpy_cash'):
+                    txt.insert(tk.END, "  - 환차익/환차손: 0원 (원화 예수금)\n")
                 txt.insert(tk.END, "\n")
             elif d.get('is_fixed'):
                 txt.insert(tk.END, f"▶ {d['name']} [{d['account']}]\n")
@@ -4137,6 +4389,8 @@ class PortfolioApp:
             cash_krw_total = 0.0
             cash_usd_total = 0.0
             cash_usd_val_krw_total = 0.0
+            cash_jpy_total = 0.0
+            cash_jpy_val_krw_total = 0.0
             for d in report_data:
                 if d.get("is_pure_cash"):
                     cash_krw_total += float(d.get("cash_krw", 0.0) or 0.0)
@@ -4144,6 +4398,10 @@ class PortfolioApp:
                     usd_krw_val = float(d.get("cash_usd_val_krw", 0.0) or 0.0)
                     cash_usd_total += usd_amt
                     cash_usd_val_krw_total += usd_krw_val
+                    jpy_amt = float(d.get("cash_jpy", 0.0) or 0.0)
+                    jpy_krw_val = float(d.get("cash_jpy_val_krw", 0.0) or 0.0)
+                    cash_jpy_total += jpy_amt
+                    cash_jpy_val_krw_total += jpy_krw_val
                     continue
 
                 name = d.get("name", "")
@@ -4181,7 +4439,9 @@ class PortfolioApp:
                 txt.insert(tk.END, f"{prof_sign}{int(row['prof']):,}원\n", tag)
                 if row["category"] == "현금성 자산":
                     txt.insert(tk.END, f"     원화 자산: {int(cash_krw_total):,}원\n")
-                    txt.insert(tk.END, f"     외화 자산: {cash_usd_total:,.2f} USD (원화환산 {int(cash_usd_val_krw_total):,}원)\n")
+                    txt.insert(tk.END, f"     달러 자산: {cash_usd_total:,.2f} USD (원화환산 {int(cash_usd_val_krw_total):,}원)\n")
+                    if cash_jpy_total > 0:
+                        txt.insert(tk.END, f"     엔화 자산: {cash_jpy_total:,.0f} JPY (원화환산 {int(cash_jpy_val_krw_total):,}원)\n")
             txt.insert(tk.END, "\n")
 
         total_tag = "up" if total_roi > 0 else ("down" if total_roi < 0 else "flat")
