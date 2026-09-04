@@ -93,6 +93,30 @@ if TYPE_CHECKING:
 
 _CI_RELEASE_MARKER = "_ci_release_build.marker"
 
+# 자산군 분포에서 예수금을 통화별로 구분한다. (리밸런싱 목표의 "현금성 자산"은 합산)
+_CASH_DEPOSIT_CATEGORIES = ("예수금(KRW)", "예수금(USD)", "예수금(JPY)")
+_CASH_LIKE_CATEGORIES = frozenset(("현금성 자산",) + _CASH_DEPOSIT_CATEGORIES)
+_MACRO_CATEGORY_COLORS = {
+    "주식": "#FF6B6B",
+    "채권": "#4D96FF",
+    "현금성 자산": "#2E7D32",
+    "예수금(KRW)": "#4CAF50",
+    "예수금(USD)": "#26A69A",
+    "예수금(JPY)": "#9CCC65",
+    "금": "#FFD700",
+    "원자재": "#B08D57",
+}
+_MACRO_CATEGORY_ORDER = (
+    "주식",
+    "채권",
+    "금",
+    "원자재",
+    "예수금(KRW)",
+    "예수금(USD)",
+    "예수금(JPY)",
+    "현금성 자산",
+)
+
 
 def _default_window_alpha() -> float:
     """
@@ -906,6 +930,7 @@ class PortfolioApp:
         """대분류 자산군에 포함된 예수금·종목과 평가금액을 텍스트로 정리한다."""
         rows = []
         total_cat = float(self.current_macro_alloc.get(category, 0.0))
+        total_portfolio = float(getattr(self, "current_total_val", 0.0) or 0.0)
         ex = float(getattr(self, "current_exchange_rate", 1400.0))
         jpy_ex = float(getattr(self, "current_jpy_exchange_rate", 9.5))
         cash_krw_total = 0.0
@@ -917,81 +942,122 @@ class PortfolioApp:
         cash_usd_by_account = defaultdict(float)
         cash_jpy_by_account = defaultdict(float)
 
-        if category == "현금성 자산":
+        # 통화별 예수금 슬라이스
+        if category in _CASH_DEPOSIT_CATEGORIES:
             for ent in self.account_cash:
                 acc = str(ent.get("account", "")).strip() or "일반 계좌"
                 ck = float(ent.get("cash_krw", 0) or 0)
                 cu = float(ent.get("cash_usd", 0) or 0)
                 cj = float(ent.get("cash_jpy", 0) or 0)
-                cash_krw_total += ck
-                cash_usd_total += cu
-                cash_usd_val_krw_total += (cu * ex)
-                cash_jpy_total += cj
-                cash_jpy_val_krw_total += (cj * jpy_ex)
-                if ck > 0:
+                if category == "예수금(KRW)" and ck > 0:
+                    cash_krw_total += ck
                     cash_krw_by_account[acc] += ck
-                if cu > 0:
-                    cash_usd_by_account[acc] += cu
-                if cj > 0:
-                    cash_jpy_by_account[acc] += cj
-                if ck > 0:
                     rows.append((f"예수금 (KRW) · {acc}", ck))
-                if cu > 0:
+                elif category == "예수금(USD)" and cu > 0:
+                    cash_usd_total += cu
+                    cash_usd_val_krw_total += cu * ex
+                    cash_usd_by_account[acc] += cu
                     rows.append((f"예수금 (USD→원화) · {acc}", cu * ex))
-                if cj > 0:
+                elif category == "예수금(JPY)" and cj > 0:
+                    cash_jpy_total += cj
+                    cash_jpy_val_krw_total += cj * jpy_ex
+                    cash_jpy_by_account[acc] += cj
                     rows.append((f"예수금 (JPY→원화) · {acc}", cj * jpy_ex))
-
-        for d in self.current_report_data:
-            name = d.get("name", "")
-            if d.get("is_fixed"):
-                cat = get_asset_category(name, "")
-            else:
-                ticker = str(d.get("ticker", "")).strip()
-                cat = get_asset_category(name, ticker)
-            if cat != category:
-                continue
-            val = float(d.get("val", 0))
-            if d.get("is_fixed"):
-                desc = f"{name} [실물/고정]"
-            else:
+        elif category == "현금성 자산":
+            # MMF·파킹 등 현금성 종목만 (순수 예수금은 통화별 카테고리로 분리)
+            for d in getattr(self, "current_report_data", []) or []:
+                if d.get("is_pure_cash"):
+                    continue
+                name = d.get("name", "")
+                if d.get("is_fixed"):
+                    cat = get_asset_category(name, "")
+                else:
+                    ticker = str(d.get("ticker", "")).strip()
+                    cat = get_asset_category(name, ticker)
+                if cat != "현금성 자산":
+                    continue
+                val = float(d.get("val", 0) or 0)
                 ticker = str(d.get("ticker", "")).strip()
                 acc = d.get("account", "")
-                desc = f"{name} ({ticker})" if ticker else name
-                if acc:
-                    desc += f" · {acc}"
-                # 현금성 자산 통화 분해: 해외 종목은 외화로, 나머지는 원화로 본다.
-                if category == "현금성 자산":
-                    if d.get("is_us"):
-                        qty = float(d.get("qty", 0) or 0)
-                        cur_p = float(d.get("cur_p", 0) or 0)
-                        usd_amt = qty * cur_p
-                        if usd_amt > 0:
-                            cash_usd_total += usd_amt
-                            cash_usd_val_krw_total += val
-                    else:
-                        cash_krw_total += val
-            rows.append((desc, val))
+                if d.get("is_fixed"):
+                    desc = f"{name} [실물/고정]"
+                else:
+                    desc = f"{name} ({ticker})" if ticker else name
+                    if acc:
+                        desc += f" · {acc}"
+                if d.get("is_us"):
+                    qty = float(d.get("qty", 0) or 0)
+                    cur_p = float(d.get("cur_p", 0) or 0)
+                    usd_amt = qty * cur_p
+                    if usd_amt > 0:
+                        cash_usd_total += usd_amt
+                        cash_usd_val_krw_total += val
+                else:
+                    cash_krw_total += val
+                rows.append((desc, val))
+
+        if category not in _CASH_LIKE_CATEGORIES:
+            for d in getattr(self, "current_report_data", []) or []:
+                if d.get("is_pure_cash"):
+                    continue
+                name = d.get("name", "")
+                if d.get("is_fixed"):
+                    cat = get_asset_category(name, "")
+                else:
+                    ticker = str(d.get("ticker", "")).strip()
+                    cat = get_asset_category(name, ticker)
+                if cat != category:
+                    continue
+                val = float(d.get("val", 0))
+                if d.get("is_fixed"):
+                    desc = f"{name} [실물/고정]"
+                else:
+                    ticker = str(d.get("ticker", "")).strip()
+                    acc = d.get("account", "")
+                    desc = f"{name} ({ticker})" if ticker else name
+                    if acc:
+                        desc += f" · {acc}"
+                rows.append((desc, val))
 
         rows.sort(key=lambda x: -x[1])
         lines = [f"【{category}】 포함 종목 · 평가금액", "=" * 40, ""]
-        if category == "현금성 자산":
+        if category == "예수금(KRW)":
+            lines.append(f"원화 예수금 합계: {int(round(cash_krw_total)):,}원")
+            if total_portfolio > 0:
+                lines.append(f"총자산 대비: {cash_krw_total / total_portfolio * 100:.1f}%")
+            if cash_krw_by_account:
+                lines.append("계좌별:")
+                for acc, amount in sorted(cash_krw_by_account.items(), key=lambda x: -x[1]):
+                    lines.append(f"  - {acc}: {int(round(amount)):,}원")
+            lines.append("")
+        elif category == "예수금(USD)":
+            lines.append(
+                f"달러 예수금 합계: {cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)"
+            )
+            if total_portfolio > 0:
+                lines.append(f"총자산 대비: {cash_usd_val_krw_total / total_portfolio * 100:.1f}%")
+            if cash_usd_by_account:
+                lines.append("계좌별:")
+                for acc, amount in sorted(cash_usd_by_account.items(), key=lambda x: -x[1]):
+                    lines.append(f"  - {acc}: {amount:,.2f} USD (원화환산 {int(round(amount * ex)):,}원)")
+            lines.append("")
+        elif category == "예수금(JPY)":
+            lines.append(
+                f"엔화 예수금 합계: {cash_jpy_total:,.0f} JPY (원화환산 {int(round(cash_jpy_val_krw_total)):,}원)"
+            )
+            if total_portfolio > 0:
+                lines.append(f"총자산 대비: {cash_jpy_val_krw_total / total_portfolio * 100:.1f}%")
+            if cash_jpy_by_account:
+                lines.append("계좌별:")
+                for acc, amount in sorted(cash_jpy_by_account.items(), key=lambda x: -x[1]):
+                    lines.append(f"  - {acc}: {amount:,.0f} JPY (원화환산 {int(round(amount * jpy_ex)):,}원)")
+            lines.append("")
+        elif category == "현금성 자산":
             lines.append(f"원화 자산 합계: {int(round(cash_krw_total)):,}원")
             fx_parts = [f"{cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)"]
             if cash_jpy_total > 0:
                 fx_parts.append(f"{cash_jpy_total:,.0f} JPY (원화환산 {int(round(cash_jpy_val_krw_total)):,}원)")
             lines.append("외화 자산 합계: " + " · ".join(fx_parts))
-            if cash_krw_by_account:
-                lines.append("원화 현금(계좌별):")
-                for acc, amount in sorted(cash_krw_by_account.items(), key=lambda x: -x[1]):
-                    lines.append(f"  - {acc}: {int(round(amount)):,}원")
-            if cash_usd_by_account:
-                lines.append("달러 현금(계좌별):")
-                for acc, amount in sorted(cash_usd_by_account.items(), key=lambda x: -x[1]):
-                    lines.append(f"  - {acc}: {amount:,.2f} USD (원화환산 {int(round(amount * ex)):,}원)")
-            if cash_jpy_by_account:
-                lines.append("엔화 현금(계좌별):")
-                for acc, amount in sorted(cash_jpy_by_account.items(), key=lambda x: -x[1]):
-                    lines.append(f"  - {acc}: {amount:,.0f} JPY (원화환산 {int(round(amount * jpy_ex)):,}원)")
             lines.append("")
         if not rows:
             lines.append("(해당 자산군에 표시할 항목이 없습니다.)")
@@ -1002,13 +1068,27 @@ class PortfolioApp:
                 lines.append(f"    {int(val):,}원 ({pct:.1f}%)")
             lines.append("")
             lines.append(f"합계 (자산군): {int(round(total_cat)):,}원")
+            if total_portfolio > 0 and category in _CASH_DEPOSIT_CATEGORIES:
+                lines.append(f"총자산 대비: {total_cat / total_portfolio * 100:.1f}%")
         return "\n".join(lines)
+
+    def _format_all_cash_breakdown(self) -> str:
+        """종목별 파이의 '현금 및 현금성 자산' 클릭 시: 예수금 통화별 + 현금성 종목."""
+        parts = []
+        for cat in _CASH_DEPOSIT_CATEGORIES:
+            if float(self.current_macro_alloc.get(cat, 0.0) or 0.0) > 0:
+                parts.append(self._format_macro_category_breakdown(cat))
+        if float(self.current_macro_alloc.get("현금성 자산", 0.0) or 0.0) > 0:
+            parts.append(self._format_macro_category_breakdown("현금성 자산"))
+        if not parts:
+            return self._format_macro_category_breakdown("현금성 자산")
+        return "\n\n".join(parts)
 
     def _format_stock_pie_slice_breakdown(self, slice_label, slice_total):
         """종목별 원형 차트의 한 조각(이름 또는 '현금 및 현금성 자산')에 대한 내역."""
         slice_total = float(slice_total)
         if slice_label == "현금 및 현금성 자산":
-            return self._format_macro_category_breakdown("현금성 자산")
+            return self._format_all_cash_breakdown()
 
         rows = []
         for d in self.current_report_data:
@@ -2821,6 +2901,15 @@ class PortfolioApp:
             return False
         return True
 
+    @staticmethod
+    def _is_cash_like_category(category: str) -> bool:
+        return category in _CASH_LIKE_CATEGORIES
+
+    @staticmethod
+    def _cash_total_from_macro(macro_alloc: dict) -> float:
+        """예수금(통화별) + 현금성 자산(MMF 등) 평가금액 합."""
+        return sum(float(macro_alloc.get(c, 0.0) or 0.0) for c in _CASH_LIKE_CATEGORIES)
+
     def get_rebalance_guide(self, total_val, macro_alloc):
         ratio_sum = sum(v for v in self.target_ratios.values() if v > 0)
         if ratio_sum <= 0:
@@ -2832,7 +2921,10 @@ class PortfolioApp:
         categories = ["주식", "채권", "금", "원자재", "현금성 자산"]
         for cat in categories:
             target_amount = total_val * (max(self.target_ratios.get(cat, 0), 0) / ratio_sum)
-            current_amount = macro_alloc.get(cat, 0.0)
+            if cat == "현금성 자산":
+                current_amount = self._cash_total_from_macro(macro_alloc)
+            else:
+                current_amount = float(macro_alloc.get(cat, 0.0) or 0.0)
             diff = target_amount - current_amount
             action = "매수" if diff > 0 else ("매도" if diff < 0 else "유지")
             guides.append({"category": cat, "current": current_amount, "target": target_amount, "diff": diff, "action": action})
@@ -2923,7 +3015,16 @@ class PortfolioApp:
             asset_values = defaultdict(float)
             report_data = []
 
-            macro_alloc = {"현금성 자산": 0.0, "주식": 0.0, "채권": 0.0, "금": 0.0, "원자재": 0.0}
+            macro_alloc = {
+                "현금성 자산": 0.0,
+                "예수금(KRW)": 0.0,
+                "예수금(USD)": 0.0,
+                "예수금(JPY)": 0.0,
+                "주식": 0.0,
+                "채권": 0.0,
+                "금": 0.0,
+                "원자재": 0.0,
+            }
 
             pure_cash_val = 0.0
             pure_cash_prin = 0.0
@@ -2947,7 +3048,13 @@ class PortfolioApp:
                 pure_cash_val += line_val
                 pure_cash_prin += line_prin
                 asset_values["현금 및 현금성 자산"] += line_val
-                macro_alloc["현금성 자산"] += line_val
+                # 예수금은 통화별로 자산군 분포에 표기 (총자산 대비 %)
+                if ck > 0:
+                    macro_alloc["예수금(KRW)"] += ck
+                if usd_val_krw > 0:
+                    macro_alloc["예수금(USD)"] += usd_val_krw
+                if jpy_val_krw > 0:
+                    macro_alloc["예수금(JPY)"] += jpy_val_krw
                 parts = []
                 if ck > 0:
                     parts.append(f"KRW {ck:,.0f}")
@@ -3059,7 +3166,10 @@ class PortfolioApp:
                     buy_ex = float(item.get('buy_exchange_rate', exchange_rate) or exchange_rate)
                     v_krw = v_usd * exchange_rate
                     p_krw = p_usd * buy_ex
-                    roi = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 else 0
+                    # 원화 기준(환손익 포함) · 달러 기준(가격만) 수익률을 모두 보관
+                    roi = ((v_krw - p_krw) / p_krw * 100) if p_krw > 0 else 0
+                    roi_usd = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 else 0
+                    prof_usd = v_usd - p_usd
                     price_prof = (cur_price - avg_price) * qty * buy_ex
                     fx_prof = (exchange_rate - buy_ex) * v_usd
                     report_data.append(
@@ -3070,7 +3180,9 @@ class PortfolioApp:
                             'is_us': True,
                             'qty': qty,
                             'roi': roi,
+                            'roi_usd': roi_usd,
                             'prof': v_krw - p_krw,
+                            'prof_usd': prof_usd,
                             'price_prof': price_prof,
                             'fx_prof': fx_prof,
                             'cur_p': cur_price,
@@ -3078,6 +3190,8 @@ class PortfolioApp:
                             'buy_exchange_rate': buy_ex,
                             'val': v_krw,
                             'prin': p_krw,
+                            'val_usd': v_usd,
+                            'prin_usd': p_usd,
                         }
                     )
 
@@ -3313,24 +3427,40 @@ class PortfolioApp:
                     txt.insert(tk.END, f"  • {d['name']} : 평가 {int(d['val']):,}원 / 원가 {int(d['prin']):,}원 ")
                 else:
                     txt.insert(tk.END, f"  • {d['name']} : 평가 {int(d['val']):,}원 / 매수 {int(d['prin']):,}원 ")
-                txt.insert(tk.END, f"({item_sign}{d['roi']:.2f}%)\n", item_tag)
+                if d.get('is_us') and not d.get('is_pure_cash'):
+                    roi_usd = float(d.get('roi_usd', 0.0) or 0.0)
+                    usd_sign = "+" if roi_usd > 0 else ""
+                    txt.insert(tk.END, f"(원화 {item_sign}{d['roi']:.2f}%", item_tag)
+                    usd_tag = "up" if roi_usd > 0 else ("down" if roi_usd < 0 else "flat")
+                    txt.insert(tk.END, f" / 달러 {usd_sign}{roi_usd:.2f}%)\n", usd_tag)
+                else:
+                    txt.insert(tk.END, f"({item_sign}{d['roi']:.2f}%)\n", item_tag)
 
             txt.insert(tk.END, "\n")
 
         txt.config(state='disabled')
 
     def _compute_account_macro_alloc(self) -> dict[str, dict[str, float]]:
-        """계좌별 자산군(주식·채권·금·원자재·현금성 자산) 평가금액."""
-        categories = ("주식", "채권", "금", "원자재", "현금성 자산")
+        """계좌별 자산군(주식·채권·금·원자재·예수금 통화별·현금성 자산) 평가금액."""
+        categories = _MACRO_CATEGORY_ORDER
         result: dict[str, dict[str, float]] = defaultdict(lambda: {c: 0.0 for c in categories})
         for d in getattr(self, "current_report_data", []) or []:
             acc = str(d.get("account", "")).strip() or "일반 계좌"
+            if d.get("is_pure_cash"):
+                ck = float(d.get("cash_krw", 0) or 0)
+                usd_val = float(d.get("cash_usd_val_krw", 0) or 0)
+                jpy_val = float(d.get("cash_jpy_val_krw", 0) or 0)
+                if ck > 0:
+                    result[acc]["예수금(KRW)"] += ck
+                if usd_val > 0:
+                    result[acc]["예수금(USD)"] += usd_val
+                if jpy_val > 0:
+                    result[acc]["예수금(JPY)"] += jpy_val
+                continue
             val = float(d.get("val", 0) or 0)
             if val <= 0:
                 continue
-            if d.get("is_pure_cash"):
-                cat = "현금성 자산"
-            elif d.get("is_fixed"):
+            if d.get("is_fixed"):
                 cat = get_asset_category(d.get("name", ""), "")
             else:
                 cat = get_asset_category(d.get("name", ""), str(d.get("ticker", "")).strip())
@@ -3343,6 +3473,7 @@ class PortfolioApp:
         rows = []
         account_alloc = self._compute_account_macro_alloc()
         total_cat = float(account_alloc.get(account, {}).get(category, 0.0))
+        account_total = sum(float(v or 0) for v in account_alloc.get(account, {}).values())
         ex = float(getattr(self, "current_exchange_rate", 1400.0))
         jpy_ex = float(getattr(self, "current_jpy_exchange_rate", 9.5))
         cash_krw_total = 0.0
@@ -3351,7 +3482,7 @@ class PortfolioApp:
         cash_jpy_total = 0.0
         cash_jpy_val_krw_total = 0.0
 
-        if category == "현금성 자산":
+        if category in _CASH_DEPOSIT_CATEGORIES:
             for ent in self.account_cash:
                 acc = str(ent.get("account", "")).strip() or "일반 계좌"
                 if acc != account:
@@ -3359,54 +3490,69 @@ class PortfolioApp:
                 ck = float(ent.get("cash_krw", 0) or 0)
                 cu = float(ent.get("cash_usd", 0) or 0)
                 cj = float(ent.get("cash_jpy", 0) or 0)
-                cash_krw_total += ck
-                cash_usd_total += cu
-                cash_usd_val_krw_total += (cu * ex)
-                cash_jpy_total += cj
-                cash_jpy_val_krw_total += (cj * jpy_ex)
-                if ck > 0:
-                    rows.append((f"예수금 (KRW)", ck))
-                if cu > 0:
-                    rows.append((f"예수금 (USD→원화)", cu * ex))
-                if cj > 0:
-                    rows.append((f"예수금 (JPY→원화)", cj * jpy_ex))
-
-        for d in getattr(self, "current_report_data", []) or []:
-            acc = str(d.get("account", "")).strip() or "일반 계좌"
-            if acc != account:
-                continue
-            name = d.get("name", "")
-            if d.get("is_fixed"):
-                cat = get_asset_category(name, "")
-            elif d.get("is_pure_cash"):
-                cat = "현금성 자산"
-            else:
-                ticker = str(d.get("ticker", "")).strip()
-                cat = get_asset_category(name, ticker)
-            if cat != category:
-                continue
-            val = float(d.get("val", 0))
-            if d.get("is_fixed"):
-                desc = f"{name} [실물/고정]"
-            elif d.get("is_pure_cash"):
-                desc = d.get("name", "예수금")
-            else:
-                ticker = str(d.get("ticker", "")).strip()
-                desc = f"{name} ({ticker})" if ticker else name
-                if category == "현금성 자산" and d.get("is_us"):
-                    qty = float(d.get("qty", 0) or 0)
-                    cur_p = float(d.get("cur_p", 0) or 0)
-                    usd_amt = qty * cur_p
-                    if usd_amt > 0:
-                        cash_usd_total += usd_amt
-                        cash_usd_val_krw_total += val
-                elif category == "현금성 자산":
-                    cash_krw_total += val
-            rows.append((desc, val))
+                if category == "예수금(KRW)" and ck > 0:
+                    cash_krw_total += ck
+                    rows.append(("예수금 (KRW)", ck))
+                elif category == "예수금(USD)" and cu > 0:
+                    cash_usd_total += cu
+                    cash_usd_val_krw_total += cu * ex
+                    rows.append(("예수금 (USD→원화)", cu * ex))
+                elif category == "예수금(JPY)" and cj > 0:
+                    cash_jpy_total += cj
+                    cash_jpy_val_krw_total += cj * jpy_ex
+                    rows.append(("예수금 (JPY→원화)", cj * jpy_ex))
+        else:
+            for d in getattr(self, "current_report_data", []) or []:
+                acc = str(d.get("account", "")).strip() or "일반 계좌"
+                if acc != account or d.get("is_pure_cash"):
+                    continue
+                name = d.get("name", "")
+                if d.get("is_fixed"):
+                    cat = get_asset_category(name, "")
+                else:
+                    ticker = str(d.get("ticker", "")).strip()
+                    cat = get_asset_category(name, ticker)
+                if cat != category:
+                    continue
+                val = float(d.get("val", 0))
+                if d.get("is_fixed"):
+                    desc = f"{name} [실물/고정]"
+                else:
+                    ticker = str(d.get("ticker", "")).strip()
+                    desc = f"{name} ({ticker})" if ticker else name
+                    if category == "현금성 자산" and d.get("is_us"):
+                        qty = float(d.get("qty", 0) or 0)
+                        cur_p = float(d.get("cur_p", 0) or 0)
+                        usd_amt = qty * cur_p
+                        if usd_amt > 0:
+                            cash_usd_total += usd_amt
+                            cash_usd_val_krw_total += val
+                    elif category == "현금성 자산":
+                        cash_krw_total += val
+                rows.append((desc, val))
 
         rows.sort(key=lambda x: -x[1])
         lines = [f"【{account} · {category}】 포함 종목 · 평가금액", "=" * 40, ""]
-        if category == "현금성 자산":
+        if category == "예수금(KRW)":
+            lines.append(f"원화 예수금 합계: {int(round(cash_krw_total)):,}원")
+            if account_total > 0:
+                lines.append(f"계좌 총자산 대비: {cash_krw_total / account_total * 100:.1f}%")
+            lines.append("")
+        elif category == "예수금(USD)":
+            lines.append(
+                f"달러 예수금 합계: {cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)"
+            )
+            if account_total > 0:
+                lines.append(f"계좌 총자산 대비: {cash_usd_val_krw_total / account_total * 100:.1f}%")
+            lines.append("")
+        elif category == "예수금(JPY)":
+            lines.append(
+                f"엔화 예수금 합계: {cash_jpy_total:,.0f} JPY (원화환산 {int(round(cash_jpy_val_krw_total)):,}원)"
+            )
+            if account_total > 0:
+                lines.append(f"계좌 총자산 대비: {cash_jpy_val_krw_total / account_total * 100:.1f}%")
+            lines.append("")
+        elif category == "현금성 자산":
             lines.append(f"원화 자산 합계: {int(round(cash_krw_total)):,}원")
             fx_parts = [f"{cash_usd_total:,.2f} USD (원화환산 {int(round(cash_usd_val_krw_total)):,}원)"]
             if cash_jpy_total > 0:
@@ -3422,6 +3568,8 @@ class PortfolioApp:
                 lines.append(f"    {int(val):,}원 ({pct:.1f}%)")
             lines.append("")
             lines.append(f"합계 (자산군): {int(round(total_cat)):,}원")
+            if account_total > 0 and category in _CASH_DEPOSIT_CATEGORIES:
+                lines.append(f"계좌 총자산 대비: {total_cat / account_total * 100:.1f}%")
         return "\n".join(lines)
 
     def show_account_allocation_popup(self):
@@ -3467,13 +3615,7 @@ class PortfolioApp:
         pie_frame = tk.Frame(pie_win, bg=self.BG)
         pie_frame.pack(fill='both', expand=True)
 
-        color_map = {
-            "주식": "#FF6B6B",
-            "채권": "#4D96FF",
-            "현금성 자산": "#4CAF50",
-            "금": "#FFD700",
-            "원자재": "#B08D57",
-        }
+        color_map = dict(_MACRO_CATEGORY_COLORS)
 
         from matplotlib.figure import Figure
 
@@ -3557,7 +3699,7 @@ class PortfolioApp:
 
     def _ordered_allocation_categories(self) -> list:
         """히스토리에 등장한 자산군 키를 UI 일관된 순서로 정렬."""
-        preferred = ("주식", "채권", "금", "원자재", "현금성 자산")
+        preferred = _MACRO_CATEGORY_ORDER
         hist = getattr(self, "history_data", None) or {}
         found: set = set()
         for rec in hist.values():
@@ -3839,7 +3981,7 @@ class PortfolioApp:
     def show_macro_pie_popup(self):
         pie_win = tk.Toplevel(self.root)
         pie_win.title("자산군별 포트폴리오 비중")
-        pie_win.geometry("500x500")
+        pie_win.geometry("560x560")
         pie_win.configure(bg=self.BG)
         self.bind_escape_to_close(pie_win)
         try:
@@ -3849,19 +3991,13 @@ class PortfolioApp:
             pass
 
         from matplotlib.figure import Figure
-        fig_pie = Figure(figsize=(5, 5))
+        fig_pie = Figure(figsize=(5.5, 5.5))
         fig_pie.patch.set_facecolor(self.BG)
         ax_pie = fig_pie.add_subplot(111)
         ax_pie.set_facecolor(self.BG)
 
         labels, sizes, colors = [], [], []
-        color_map = {
-            "주식": "#FF6B6B",
-            "채권": "#4D96FF",
-            "현금성 자산": "#4CAF50",
-            "금": "#FFD700",
-            "원자재": "#B08D57",
-        }
+        color_map = dict(_MACRO_CATEGORY_COLORS)
 
         for name, value in sorted(self.current_macro_alloc.items(), key=lambda x: x[1], reverse=True):
             if value > 0:
@@ -3876,13 +4012,20 @@ class PortfolioApp:
             autopct='%1.1f%%',
             startangle=90,
             wedgeprops={'edgecolor': 'black', 'linewidth': 1.5},
+            textprops={'fontsize': 10},
         )
         for t in texts + autotexts:
             t.set_color('white')
-            t.set_fontsize(11)
+            t.set_fontsize(10)
             t.set_fontweight('bold')
 
-        ax_pie.set_title("안전/위험 자산 배분 현황 (호버: 요약 · 클릭: 종목 구성)", color="white", fontsize=14, fontweight='bold', pad=15)
+        ax_pie.set_title(
+            "자산군 배분 (예수금: KRW/USD/JPY 구분 · 호버: 요약 · 클릭: 구성)",
+            color="white",
+            fontsize=12,
+            fontweight='bold',
+            pad=15,
+        )
 
         canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_win)
         canvas_pie.draw()
@@ -3915,7 +4058,9 @@ class PortfolioApp:
         labels, sizes, colors = [], [], []
         color_map = {"주식": "#FF6B6B", "채권": "#4D96FF", "금": "#FFD700", "원자재": "#B08D57"}
 
-        invest_alloc = {k: v for k, v in self.current_macro_alloc.items() if k != "현금성 자산" and v > 0}
+        invest_alloc = {
+            k: v for k, v in self.current_macro_alloc.items() if not self._is_cash_like_category(k) and v > 0
+        }
 
         if not invest_alloc:
             ax_pie.text(
@@ -4254,16 +4399,29 @@ class PortfolioApp:
         sums: defaultdict[str, dict[str, float]] = defaultdict(lambda: {"prin": 0.0, "val": 0.0})
         for d in report_data:
             if d.get("is_pure_cash"):
-                cat = "현금성 자산"
-            elif d.get("is_fixed"):
+                ck = float(d.get("cash_krw", 0) or 0)
+                usd_val = float(d.get("cash_usd_val_krw", 0) or 0)
+                jpy_val = float(d.get("cash_jpy_val_krw", 0) or 0)
+                usd_cost = float(d.get("usd_cost_krw", 0) or 0)
+                jpy_cost = float(d.get("jpy_cost_krw", 0) or 0)
+                if ck > 0:
+                    sums["예수금(KRW)"]["prin"] += ck
+                    sums["예수금(KRW)"]["val"] += ck
+                if usd_val > 0 or usd_cost > 0:
+                    sums["예수금(USD)"]["prin"] += usd_cost
+                    sums["예수금(USD)"]["val"] += usd_val
+                if jpy_val > 0 or jpy_cost > 0:
+                    sums["예수금(JPY)"]["prin"] += jpy_cost
+                    sums["예수금(JPY)"]["val"] += jpy_val
+                continue
+            if d.get("is_fixed"):
                 cat = get_asset_category(d.get("name", ""), "")
             else:
                 cat = get_asset_category(d.get("name", ""), d.get("ticker", ""))
             sums[cat]["prin"] += float(d.get("prin", 0) or 0)
             sums[cat]["val"] += float(d.get("val", 0) or 0)
-        order = ("주식", "채권", "금", "원자재", "현금성 자산")
         rows: list[dict] = []
-        for cat in order:
+        for cat in _MACRO_CATEGORY_ORDER:
             if cat not in sums:
                 continue
             prin = sums[cat]["prin"]
@@ -4359,12 +4517,35 @@ class PortfolioApp:
                     txt.insert(tk.END, f"  - 보유 수량: {qty:,.4f}\n")
                 txt.insert(tk.END, f"  - 현재 가격: {d['cur_p']:,.2f}{unit}\n")
                 txt.insert(tk.END, f"  - 평단: {d['avg_p']:,.2f}{unit}  ·  ")
-                txt.insert(tk.END, f"수익률 {sign}{d['roi']:.2f}%\n", tag)
+                if d.get('is_us'):
+                    txt.insert(tk.END, f"원화 수익률 {sign}{d['roi']:.2f}%\n", tag)
+                else:
+                    txt.insert(tk.END, f"수익률 {sign}{d['roi']:.2f}%\n", tag)
                 txt.insert(tk.END, f"  - 평가액: {int(d['val']):,}원  ·  매수액: {int(d['prin']):,}원\n")
                 txt.insert(tk.END, "  - 손익금: ")
-                txt.insert(tk.END, f"{sign}{int(d['prof']):,}원\n\n", tag)
+                txt.insert(tk.END, f"{sign}{int(d['prof']):,}원\n", tag)
                 if d.get('is_us'):
                     buy_ex = float(d.get('buy_exchange_rate', ex_rate))
+                    val_usd = float(d.get('val_usd', 0.0) or 0.0)
+                    prin_usd = float(d.get('prin_usd', 0.0) or 0.0)
+                    if val_usd <= 0 and qty is not None:
+                        val_usd = float(d.get('cur_p', 0) or 0) * float(qty)
+                    if prin_usd <= 0 and qty is not None:
+                        prin_usd = float(d.get('avg_p', 0) or 0) * float(qty)
+                    prof_usd = float(d.get('prof_usd', val_usd - prin_usd) or 0.0)
+                    roi_usd = float(d.get('roi_usd', 0.0) or 0.0)
+                    if 'roi_usd' not in d and prin_usd > 0:
+                        roi_usd = (prof_usd / prin_usd) * 100.0
+                    usd_tag = "up" if roi_usd > 0 else ("down" if roi_usd < 0 else "flat")
+                    usd_sign = "+" if roi_usd > 0 else ""
+                    prof_usd_sign = "+" if prof_usd > 0 else ""
+                    txt.insert(
+                        tk.END,
+                        f"  - 달러 기준: 평가 ${val_usd:,.2f}  ·  매수 ${prin_usd:,.2f}  ·  ",
+                    )
+                    txt.insert(tk.END, f"손익 {prof_usd_sign}${prof_usd:,.2f}", usd_tag)
+                    txt.insert(tk.END, "  ·  ")
+                    txt.insert(tk.END, f"수익률 {usd_sign}{roi_usd:.2f}%\n", usd_tag)
                     txt.insert(tk.END, f"  - 매수 기준 환율: 1 USD = {buy_ex:,.2f} KRW\n")
                     price_prof = float(d.get('price_prof', 0.0))
                     fx_prof = float(d.get('fx_prof', 0.0))
@@ -4372,10 +4553,12 @@ class PortfolioApp:
                     fx_tag = "up" if fx_prof > 0 else ("down" if fx_prof < 0 else "flat")
                     price_sign = "+" if price_prof > 0 else ""
                     fx_sign = "+" if fx_prof > 0 else ""
-                    txt.insert(tk.END, "  - 가격손익: ")
+                    txt.insert(tk.END, "  - 가격손익(원화 환산): ")
                     txt.insert(tk.END, f"{price_sign}{int(price_prof):,}원\n", price_tag)
                     txt.insert(tk.END, "  - 환손익: ")
                     txt.insert(tk.END, f"{fx_sign}{int(fx_prof):,}원\n\n", fx_tag)
+                else:
+                    txt.insert(tk.END, "\n")
 
         txt.insert(tk.END, "=" * 45 + "\n")
         txt.insert(tk.END, "[ 전체 포트폴리오 요약 ]\n", "title")
@@ -4437,6 +4620,8 @@ class PortfolioApp:
                 txt.insert(tk.END, f"{sign}{row['roi']:.2f}%\n", tag)
                 txt.insert(tk.END, "     손익 ")
                 txt.insert(tk.END, f"{prof_sign}{int(row['prof']):,}원\n", tag)
+                if total_val > 0:
+                    txt.insert(tk.END, f"     총자산 대비: {row['val'] / total_val * 100:.1f}%\n")
                 if row["category"] == "현금성 자산":
                     txt.insert(tk.END, f"     원화 자산: {int(cash_krw_total):,}원\n")
                     txt.insert(tk.END, f"     달러 자산: {cash_usd_total:,.2f} USD (원화환산 {int(cash_usd_val_krw_total):,}원)\n")
