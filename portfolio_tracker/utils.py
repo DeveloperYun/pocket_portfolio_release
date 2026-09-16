@@ -209,8 +209,12 @@ def get_realized_pnl_records_file_path() -> str:
 
 
 def is_korean_ticker(ticker: Any) -> bool:
-    ticker_str = str(ticker).strip()
-    return len(ticker_str) == 6 and ticker_str[0].isdigit()
+    """KRX 종목코드(6자리). 숫자만(005930) 및 알파숫자(0064K0, 0131V0) 모두 포함."""
+    ticker_str = str(ticker).strip().upper()
+    if len(ticker_str) != 6 or not ticker_str[0].isdigit():
+        return False
+    # 나머지: 숫자 또는 대문자 (신규 상장 알파벳 포함 코드)
+    return all(ch.isdigit() or ("A" <= ch <= "Z") for ch in ticker_str[1:])
 
 
 def normalize_ticker_base(ticker: Any) -> str:
