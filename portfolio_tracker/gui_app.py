@@ -16,7 +16,6 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from bs4 import BeautifulSoup
 
 import matplotlib
 
@@ -1197,8 +1196,40 @@ class PortfolioApp:
                 pass
         self._line_chart_hover_cids = []
 
-    def _setup_line_series_hover(self, ax, dates, y_values, build_tooltip, pick_px=22.0):
-        """단일 Y 꺾은선: 가까운 마커에 대해 build_tooltip(i) 문자열을 툴팁으로 표시."""
+    def _nearest_line_point_index(self, ax, event, x_nums, y_series_list, pick_px=22.0):
+        """마우스 좌표에서 가장 가까운 마커 인덱스. 임계치 밖이면 None."""
+        if event is None or event.inaxes != ax:
+            return None
+        n = len(x_nums)
+        best_i = None
+        best_d = pick_px + 1.0
+        for i in range(n):
+            for ys in y_series_list:
+                try:
+                    y = float(ys[i])
+                    px, py = ax.transData.transform((x_nums[i], y))
+                except Exception:
+                    continue
+                dist = math.hypot(event.x - px, event.y - py)
+                if dist < best_d:
+                    best_d = dist
+                    best_i = i
+        return best_i if best_i is not None and best_d <= pick_px else None
+
+    def _strip_tz_index(self, idx) -> pd.DatetimeIndex:
+        out = pd.to_datetime(idx)
+        try:
+            if getattr(out, "tz", None) is not None:
+                out = out.tz_convert(None)
+        except Exception:
+            try:
+                out = pd.DatetimeIndex([pd.Timestamp(t).to_pydatetime().replace(tzinfo=None) for t in out])
+            except Exception:
+                pass
+        return out
+
+    def _setup_line_series_hover(self, ax, dates, y_values, build_tooltip, pick_px=22.0, on_point_click=None):
+        """단일 Y 꺾은선: 가까운 마커에 대해 build_tooltip(i) 문자열을 툴팁으로 표시. 클릭 시 on_point_click."""
         n = len(dates)
         if n == 0 or not hasattr(self, "canvas_line"):
             return
@@ -1234,19 +1265,9 @@ class PortfolioApp:
                     prev_idx[0] = None
                 return
 
-            best_i = None
-            best_d = pick_px + 1.0
-            for i in range(n):
-                try:
-                    px, py = ax.transData.transform((x_nums[i], yv[i]))
-                except Exception:
-                    continue
-                dist = math.hypot(event.x - px, event.y - py)
-                if dist < best_d:
-                    best_d = dist
-                    best_i = i
+            best_i = self._nearest_line_point_index(ax, event, x_nums, [yv], pick_px=pick_px)
 
-            if best_i is None or best_d > pick_px:
+            if best_i is None:
                 if annot.get_visible():
                     annot.set_visible(False)
                     canvas.draw_idle()
@@ -1258,7 +1279,10 @@ class PortfolioApp:
             prev_idx[0] = best_i
 
             annot.xy = (x_nums[best_i], yv[best_i])
-            annot.set_text(build_tooltip(best_i))
+            tip = str(build_tooltip(best_i) or "")
+            if "클릭" not in tip:
+                tip = tip + "\n(클릭: 변동폭 상위 종목)"
+            annot.set_text(tip)
 
             x0, x1 = ax.get_xlim()
             span = (x1 - x0) or 1.0
@@ -1272,10 +1296,19 @@ class PortfolioApp:
             annot.set_visible(True)
             canvas.draw_idle()
 
-        cid = canvas.mpl_connect("motion_notify_event", on_hover)
-        self._line_chart_hover_cids.append(cid)
+        def on_click(event):
+            if on_point_click is None or event.button != 1:
+                return
+            best_i = self._nearest_line_point_index(ax, event, x_nums, [yv], pick_px=pick_px)
+            if best_i is None and event.inaxes == ax and annot.get_visible() and prev_idx[0] is not None:
+                best_i = prev_idx[0]
+            if best_i is not None:
+                on_point_click(best_i)
 
-    def _setup_line_chart_val_hover(self, ax_val, dates, prins, vals):
+        self._line_chart_hover_cids.append(canvas.mpl_connect("motion_notify_event", on_hover))
+        self._line_chart_hover_cids.append(canvas.mpl_connect("button_press_event", on_click))
+
+    def _setup_line_chart_val_hover(self, ax_val, dates, prins, vals, on_point_click=None):
         """
         자산 규모(원금·평가금) 꺾은선이 겹쳐 보일 때, 마우스 근처 시점의 원금·평가금을 툴팁으로 표시한다.
         """
@@ -1316,20 +1349,9 @@ class PortfolioApp:
                     prev_idx[0] = None
                 return
 
-            best_i = None
-            best_d = pick_px + 1.0
-            for i in range(n):
-                for y in (pr[i], va[i]):
-                    try:
-                        px, py = ax_val.transData.transform((x_nums[i], y))
-                    except Exception:
-                        continue
-                    d = math.hypot(event.x - px, event.y - py)
-                    if d < best_d:
-                        best_d = d
-                        best_i = i
+            best_i = self._nearest_line_point_index(ax_val, event, x_nums, [pr, va], pick_px=pick_px)
 
-            if best_i is None or best_d > pick_px:
+            if best_i is None:
                 if annot.get_visible():
                     annot.set_visible(False)
                     canvas.draw_idle()
@@ -1342,7 +1364,9 @@ class PortfolioApp:
 
             dstr = _date_with_weekday_kr(dates[best_i])
             annot.xy = (x_nums[best_i], max(pr[best_i], va[best_i]))
-            annot.set_text(f"{dstr}\n투자원금: {int(pr[best_i]):,}원\n평가금: {int(va[best_i]):,}원")
+            annot.set_text(
+                f"{dstr}\n투자원금: {int(pr[best_i]):,}원\n평가금: {int(va[best_i]):,}원\n(클릭: 변동폭 상위 종목)"
+            )
             x0, x1 = ax_val.get_xlim()
             span = (x1 - x0) or 1.0
             x_frac = (x_nums[best_i] - x0) / span
@@ -1355,8 +1379,17 @@ class PortfolioApp:
             annot.set_visible(True)
             canvas.draw_idle()
 
-        cid = canvas.mpl_connect("motion_notify_event", on_hover)
-        self._line_chart_hover_cids.append(cid)
+        def on_click(event):
+            if on_point_click is None or event.button != 1:
+                return
+            best_i = self._nearest_line_point_index(ax_val, event, x_nums, [pr, va], pick_px=pick_px)
+            if best_i is None and event.inaxes == ax_val and annot.get_visible() and prev_idx[0] is not None:
+                best_i = prev_idx[0]
+            if best_i is not None:
+                on_point_click(best_i)
+
+        self._line_chart_hover_cids.append(canvas.mpl_connect("motion_notify_event", on_hover))
+        self._line_chart_hover_cids.append(canvas.mpl_connect("button_press_event", on_click))
 
     def on_alpha_slider_change(self, value):
         try:
@@ -2728,17 +2761,86 @@ class PortfolioApp:
             return float(getattr(self, "current_jpy_exchange_rate", 9.5) or 9.5)
 
     def get_kr_price(self, code):
+        """
+        국내(KRX) 종목 현재가.
+        - PC HTML(.no_today)은 Npay 증권 개편으로 파서가 깨짐
+        - 문자 포함 신규코드(예: 0064K0, 0131V0)도 동일 API로 처리
+        """
+        code = str(code or "").strip()
+        if not code:
+            return 0.0
+
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://m.stock.naver.com/",
+        }
+
+        # 1) 네이버 모바일 stock API (숫자/알파숫자 종목코드 모두 지원)
         try:
             res = requests.get(
-                f"https://finance.naver.com/item/main.naver?code={code}",
-                headers={'User-Agent': 'Mozilla/5.0'},
+                f"https://m.stock.naver.com/api/stock/{code}/basic",
+                headers=headers,
                 timeout=5,
             )
-            price_tag = BeautifulSoup(res.text, 'html.parser').select_one('.no_today .blind')
-            if price_tag:
-                return float(price_tag.text.replace(',', ''))
+            if res.ok:
+                data = res.json() if res.content else {}
+                if isinstance(data, dict):
+                    for key in ("closePrice", "dealPrice", "nowVal"):
+                        raw = data.get(key)
+                        if raw is None:
+                            continue
+                        try:
+                            price = float(str(raw).replace(",", "").strip())
+                        except (TypeError, ValueError):
+                            continue
+                        if price > 0:
+                            return price
+                    over = data.get("overMarketPriceInfo") or {}
+                    if isinstance(over, dict):
+                        raw = over.get("overPrice")
+                        try:
+                            price = float(str(raw).replace(",", "").strip()) if raw is not None else 0.0
+                        except (TypeError, ValueError):
+                            price = 0.0
+                        if price > 0:
+                            return price
         except Exception:
             pass
+
+        # 2) 폴링 API fallback
+        try:
+            res = requests.get(
+                f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}",
+                headers=headers,
+                timeout=5,
+            )
+            if res.ok:
+                data = res.json() if res.content else {}
+                areas = ((data.get("result") or {}).get("areas") or [])
+                for area in areas:
+                    for row in (area.get("datas") or []):
+                        for key in ("nv", "sv"):
+                            try:
+                                price = float(row.get(key) or 0)
+                            except (TypeError, ValueError):
+                                price = 0.0
+                            if price > 0:
+                                return price
+        except Exception:
+            pass
+
+        # 3) Yahoo .KS / .KQ fallback (신규 알파숫자 코드 포함)
+        for suffix in (".KS", ".KQ"):
+            try:
+                hist = yf.Ticker(f"{code}{suffix}").history(period="5d")
+                if hist is not None and not hist.empty:
+                    price = float(hist["Close"].iloc[-1])
+                    if price > 0:
+                        return price
+            except Exception:
+                continue
+
         return 0.0
 
     def get_krx_gold_price_krw_per_g(self, reuters_code="M04020000", category="metals"):
@@ -4172,6 +4274,347 @@ class PortfolioApp:
 
         txt.config(state='disabled')
 
+    def _yahoo_symbol_for_report_row(self, row: dict) -> str | None:
+        """보고서 행 → Yahoo 심볼. 현금/실물/비시세 종목은 None."""
+        if not isinstance(row, dict):
+            return None
+        if row.get("is_pure_cash") or row.get("is_fixed"):
+            return None
+        ticker = str(row.get("ticker", "")).strip()
+        if not ticker or ticker.upper() == "FIXED":
+            return None
+        if is_korean_ticker(ticker):
+            return f"{ticker.upper()}.KS"
+        return ticker.upper()
+
+    def _extract_yahoo_close_series(self, download_df: pd.DataFrame, symbol: str) -> pd.Series | None:
+        """yf.download 결과에서 심볼별 Close 시계열을 꺼낸다."""
+        if download_df is None or download_df.empty:
+            return None
+        try:
+            if isinstance(download_df.columns, pd.MultiIndex):
+                level0 = download_df.columns.get_level_values(0)
+                if symbol not in set(level0):
+                    return None
+                sub = download_df[symbol]
+                if "Close" not in sub.columns:
+                    return None
+                s = sub["Close"].dropna()
+            else:
+                if "Close" not in download_df.columns:
+                    return None
+                s = download_df["Close"].dropna()
+            if s is None or s.empty:
+                return None
+            s = s.copy()
+            s.index = self._strip_tz_index(s.index)
+            return s.sort_index()
+        except Exception:
+            return None
+
+    def _fetch_holding_close_map(self) -> dict[str, pd.Series]:
+        """보유 종목 Yahoo Close 시계열 맵(symbol → Series)."""
+        rows = getattr(self, "current_report_data", []) or []
+        symbols: list[str] = []
+        for row in rows:
+            sym = self._yahoo_symbol_for_report_row(row)
+            if sym:
+                symbols.append(sym)
+        symbols = sorted(set(symbols))
+        if not symbols:
+            return {}
+
+        out: dict[str, pd.Series] = {}
+        try:
+            raw = yf.download(
+                symbols,
+                period="3mo",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+            )
+        except Exception:
+            raw = None
+
+        missing: list[str] = []
+        if raw is not None and not getattr(raw, "empty", True):
+            for sym in symbols:
+                series = self._extract_yahoo_close_series(raw, sym)
+                if series is not None and len(series) >= 2:
+                    out[sym] = series
+                else:
+                    missing.append(sym)
+        else:
+            missing = list(symbols)
+
+        # 배치 누락분 개별 재시도(.KQ 포함)
+        for sym in missing:
+            candidates = [sym]
+            if sym.endswith(".KS"):
+                candidates.append(sym[:-3] + ".KQ")
+            got = None
+            for cand in candidates:
+                try:
+                    hist = yf.Ticker(cand).history(period="3mo", auto_adjust=True)
+                    if hist is None or hist.empty or "Close" not in hist.columns:
+                        continue
+                    s = hist["Close"].dropna()
+                    if len(s) < 2:
+                        continue
+                    s = s.copy()
+                    s.index = self._strip_tz_index(s.index)
+                    got = s.sort_index()
+                    break
+                except Exception:
+                    continue
+            if got is not None:
+                out[sym] = got
+        return out
+
+    def _compute_period_movers(
+        self,
+        trading_days_back: int,
+        close_map: dict[str, pd.Series] | None = None,
+        period_label: str = "",
+    ) -> list[dict]:
+        """
+        현재가 대비 N거래일 전 종가 기준 종목 변동 목록.
+        정렬: |원화손익| 내림차순.
+        """
+        rows = getattr(self, "current_report_data", []) or []
+        if not rows:
+            return []
+        if close_map is None:
+            close_map = self._fetch_holding_close_map()
+
+        ex = float(getattr(self, "current_exchange_rate", 0) or 0) or float(self.get_exchange_rate() or 0)
+        n_back = max(1, int(trading_days_back))
+        movers: list[dict] = []
+
+        for row in rows:
+            sym = self._yahoo_symbol_for_report_row(row)
+            if not sym:
+                continue
+            closes = close_map.get(sym)
+            if closes is None or len(closes) <= n_back:
+                continue
+            try:
+                past = float(closes.iloc[-(n_back + 1)])
+                past_asof = pd.Timestamp(closes.index[-(n_back + 1)]).strftime("%Y-%m-%d")
+            except (TypeError, ValueError, IndexError):
+                continue
+            if past <= 0:
+                continue
+
+            try:
+                qty = float(row.get("qty", 0) or 0)
+                cur = float(row.get("cur_p", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0 or cur <= 0:
+                try:
+                    cur = float(closes.iloc[-1])
+                except (TypeError, ValueError):
+                    cur = 0.0
+            if qty <= 0 or cur <= 0:
+                continue
+
+            is_us = bool(row.get("is_us"))
+            chg_pct = (cur - past) / past * 100.0
+            unit_pnl = (cur - past) * qty
+            pnl_krw = unit_pnl * ex if is_us else unit_pnl
+            movers.append(
+                {
+                    "name": str(row.get("name", "")).strip() or sym,
+                    "ticker": str(row.get("ticker", "")).strip(),
+                    "account": str(row.get("account", "")).strip() or "일반 계좌",
+                    "qty": qty,
+                    "past_price": past,
+                    "cur_price": cur,
+                    "chg_pct": chg_pct,
+                    "pnl_krw": pnl_krw,
+                    "is_us": is_us,
+                    "past_asof": past_asof,
+                    "period_label": period_label,
+                }
+            )
+
+        movers.sort(key=lambda m: abs(float(m.get("pnl_krw", 0) or 0)), reverse=True)
+        return movers
+
+    def show_top_movers_dialog(self, initial_period: str | None = None):
+        """
+        전일/전주/전월 대비 변동폭(원화손익 절대값) 상위 종목 다이얼로그.
+        initial_period: '일간'|'주간'|'월간' → 대응 탭 선택.
+        """
+        # 같은 클릭에서 subplot 핸들러가 연속 호출되는 경우 방지
+        now_ts = datetime.datetime.now().timestamp()
+        last = float(getattr(self, "_top_movers_dialog_opened_at", 0) or 0)
+        if now_ts - last < 0.6:
+            return
+        self._top_movers_dialog_opened_at = now_ts
+
+        parent = self.chart_win if (self.chart_win and self.chart_win.winfo_exists()) else self.root
+        if not getattr(self, "current_report_data", None):
+            messagebox.showinfo("변동폭 상위 종목", "먼저 '계산 및 차트/수익률 보기'를 실행하세요.", parent=parent)
+            return
+
+        existing = getattr(self, "_top_movers_win", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    self._set_window_alpha(existing)
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+
+        period_specs = [
+            ("전일 대비", 1, "일간"),    # 1거래일 전
+            ("전주 대비", 5, "주간"),    # 약 1주(5거래일) 전
+            ("전월 대비", 21, "월간"),   # 약 1개월(21거래일) 전
+        ]
+        init_key = initial_period if initial_period in ("일간", "주간", "월간") else (
+            getattr(self, "current_chart_view_mode", "일간") or "일간"
+        )
+
+        win = tk.Toplevel(self.root)
+        win.title("기간 대비 변동폭 상위 종목")
+        win.configure(bg=self.BG)
+        win.geometry("760x560")
+        try:
+            win.transient(parent)
+        except Exception:
+            pass
+        self._top_movers_win = win
+
+        def _on_close(_event=None):
+            if getattr(self, "_top_movers_win", None) is win:
+                self._top_movers_win = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            return "break"
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        try:
+            win.bind("<Escape>", _on_close)
+        except Exception:
+            pass
+        try:
+            self._set_window_alpha(win)
+        except Exception:
+            pass
+        self._schedule_alpha_sync_for_window(win)
+
+        tk.Label(
+            win,
+            text="전일 / 전주 / 전월 대비 변동폭이 큰 종목 (원화손익 절대값 순)",
+            bg=self.BG,
+            fg=self.FG,
+            font=(self.FONT_MAIN[0], 12, "bold"),
+        ).pack(anchor="w", padx=14, pady=(12, 4))
+        tk.Label(
+            win,
+            text="현재 보유수량·현재가 기준. 과거가는 Yahoo 종가(전일=1·전주=5·전월=21 거래일 전)를 사용합니다.",
+            bg=self.BG,
+            fg=self.MUTED,
+            font=self.FONT_CAPTION,
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        status = tk.Label(win, text="시세 히스토리 불러오는 중…", bg=self.BG, fg="#87CEFA", font=self.FONT_CAPTION)
+        status.pack(anchor="w", padx=14)
+
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=12, pady=(6, 12))
+
+        text_widgets: dict[str, tk.Text] = {}
+        for title, _days, key in period_specs:
+            fr = tk.Frame(nb, bg=self.CARD_BG)
+            nb.add(fr, text=title)
+            scroll = tk.Scrollbar(fr)
+            scroll.pack(side="right", fill="y")
+            txt = tk.Text(
+                fr,
+                bg=self.ENTRY_BG,
+                fg=self.FG,
+                font=(self.FONT_MAIN[0], 11),
+                yscrollcommand=scroll.set,
+                wrap="none",
+            )
+            txt.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+            scroll.config(command=txt.yview)
+            txt.tag_configure("up", foreground="#FF6B6B")
+            txt.tag_configure("down", foreground="#4D96FF")
+            txt.tag_configure("flat", foreground=self.MUTED)
+            txt.tag_configure("head", foreground="#FFD700", font=(self.FONT_MAIN[0], 11, "bold"))
+            txt.tag_configure("meta", foreground=self.MUTED)
+            txt.insert(tk.END, "데이터 준비 중…\n", "meta")
+            txt.config(state="disabled")
+            text_widgets[key] = txt
+
+        for i, (_t, _d, key) in enumerate(period_specs):
+            if key == init_key:
+                nb.select(i)
+                break
+
+        def _fill_tab(key: str, title: str, movers: list[dict]):
+            txt = text_widgets[key]
+            txt.config(state="normal")
+            txt.delete("1.0", tk.END)
+            if not movers:
+                txt.insert(tk.END, f"{title} 비교 가능한 종목 데이터가 없습니다.\n", "meta")
+                txt.config(state="disabled")
+                return
+            asof = movers[0].get("past_asof", "")
+            txt.insert(tk.END, f"{title}  (과거기준일 ≤ {asof}, 상위 {min(30, len(movers))}종목)\n\n", "head")
+            for rank, m in enumerate(movers[:30], start=1):
+                pnl = float(m["pnl_krw"])
+                pct = float(m["chg_pct"])
+                tag = "up" if pnl > 0 else ("down" if pnl < 0 else "flat")
+                pnl_sign = "+" if pnl >= 0 else ""
+                pct_sign = "+" if pct >= 0 else ""
+                unit = "$" if m["is_us"] else "원"
+                past_p = m["past_price"]
+                cur_p = m["cur_price"]
+                if m["is_us"]:
+                    price_line = f"{past_p:.2f}{unit} → {cur_p:.2f}{unit}"
+                else:
+                    price_line = f"{past_p:,.0f}{unit} → {cur_p:,.0f}{unit}"
+                txt.insert(
+                    tk.END,
+                    f"{rank:2d}. [{m['account']}] {m['name']} ({m['ticker']})\n",
+                    tag,
+                )
+                txt.insert(
+                    tk.END,
+                    f"     수량 {m['qty']:g} | {price_line} | 변동 {pct_sign}{pct:.2f}% | "
+                    f"손익 {pnl_sign}{int(round(pnl)):,}원\n",
+                    tag,
+                )
+            txt.config(state="disabled")
+
+        def _load():
+            try:
+                close_map = self._fetch_holding_close_map()
+                for title, days, key in period_specs:
+                    movers = self._compute_period_movers(days, close_map=close_map, period_label=title)
+                    _fill_tab(key, title, movers)
+                status.config(text=f"완료 — 비교 가능 종목 {len(close_map)}개", fg="#00FF00")
+            except Exception as e:
+                status.config(text=f"실패: {e}", fg="#FF6B6B")
+                for _t, _d, key in period_specs:
+                    tw = text_widgets[key]
+                    tw.config(state="normal")
+                    tw.delete("1.0", tk.END)
+                    tw.insert(tk.END, f"불러오기 실패: {e}\n", "meta")
+                    tw.config(state="disabled")
+
+        win.after(50, _load)
+
     def update_line_chart(self, view_mode):
         if not hasattr(self, 'history_data') or not self.history_data:
             return
@@ -4355,8 +4798,13 @@ class PortfolioApp:
                     head + f"{lbl}: {sign}{r:.2f}%\n" + f"{lbl} 원화손익: {dval_text}"
                 )
 
-            self._setup_line_series_hover(ax_roi, dates, rois.values, _roi_tip)
-            self._setup_line_series_hover(ax_pure_day, dates, pure_day_returns.values, _pure_tip)
+            def _open_movers(_i=None):
+                # 차트 모드와 맞는 탭을 기본 선택
+                mode = view_mode if view_mode in ("일간", "주간", "월간") else "일간"
+                self.show_top_movers_dialog(initial_period=mode)
+
+            self._setup_line_series_hover(ax_roi, dates, rois.values, _roi_tip, on_point_click=_open_movers)
+            self._setup_line_series_hover(ax_pure_day, dates, pure_day_returns.values, _pure_tip, on_point_click=_open_movers)
 
             ax_val = self.fig_line.add_subplot(313)
             ax_val.set_facecolor(self.BG)
@@ -4372,7 +4820,7 @@ class PortfolioApp:
             ax_val.legend(loc='upper left', facecolor=self.BG, edgecolor='white', labelcolor='white', fontsize=9)
             ax_val.grid(True, linestyle=':', alpha=0.2)
 
-            self._setup_line_chart_val_hover(ax_val, dates, prins, vals)
+            self._setup_line_chart_val_hover(ax_val, dates, prins, vals, on_point_click=_open_movers)
 
             self.fig_line.autofmt_xdate()
             self.fig_line.subplots_adjust(hspace=0.55)
