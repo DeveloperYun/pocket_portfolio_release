@@ -318,4 +318,3 @@ def get_asset_category(name: Any, ticker: Any = "") -> str:
         return "원자재"
 
     return "주식"
-
