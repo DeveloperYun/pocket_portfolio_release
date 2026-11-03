@@ -169,6 +169,31 @@ class PortfolioApp:
 
         self.current_alpha = _default_window_alpha()
         self.chart_win = None
+        self.compact_pnl_win = None
+        self.compact_pnl_label = None
+        self.compact_roi_label = None
+        self.compact_usd_label = None
+        self.compact_jpy_label = None
+        self.compact_kospi_label = None
+        self.compact_cat_stock_label = None
+        self.compact_cat_bond_label = None
+        self.compact_cat_gold_label = None
+        self.compact_cat_comm_label = None
+        self.compact_cat_cash_label = None
+        self.compact_pnl_updated_label = None
+        self.current_kospi = 0.0
+        self.current_usd_chg = None
+        self.current_jpy_chg = None
+        self.current_kospi_chg = None
+        self.current_category_day_chg = {
+            "주식": {"chg_amt": None, "chg_pct": None},
+            "채권": {"chg_amt": None, "chg_pct": None},
+            "금": {"chg_amt": None, "chg_pct": None},
+            "원자재": {"chg_amt": None, "chg_pct": None},
+            "현금성 자산": {"chg_amt": None, "chg_pct": None},
+        }
+        self.current_total_value_day_chg = None
+        self.current_pure_day_pct = None
         self.chart_auto_refresh_job = None
         self.chart_auto_refresh_interval_ms = 30000
         self.current_chart_view_mode = "일간"
@@ -1463,6 +1488,11 @@ class PortfolioApp:
         except Exception:
             pass
 
+    def _has_auto_refresh_target(self) -> bool:
+        chart_ok = bool(self.chart_win and self.chart_win.winfo_exists())
+        compact_ok = bool(self.compact_pnl_win and self.compact_pnl_win.winfo_exists())
+        return chart_ok or compact_ok
+
     def _cancel_chart_auto_refresh(self):
         if self.chart_auto_refresh_job and self.root.winfo_exists():
             try:
@@ -1473,7 +1503,7 @@ class PortfolioApp:
 
     def _schedule_chart_auto_refresh(self):
         self._cancel_chart_auto_refresh()
-        if not (self.chart_win and self.chart_win.winfo_exists()):
+        if not self._has_auto_refresh_target():
             return
         self.chart_auto_refresh_job = self.root.after(
             self.chart_auto_refresh_interval_ms,
@@ -1482,17 +1512,17 @@ class PortfolioApp:
 
     def _on_chart_auto_refresh(self):
         self.chart_auto_refresh_job = None
-        if not (self.chart_win and self.chart_win.winfo_exists()):
+        if not self._has_auto_refresh_target():
             return
         try:
-            self.lbl_status.config(text="그래프 자동 갱신 중... (30초 주기)", fg="#87CEFA")
+            self.lbl_status.config(text="자동 갱신 중... (30초 주기)", fg="#87CEFA")
             self.calculate_and_draw(in_place_refresh=True)
         except Exception:
             self.lbl_status.config(text="자동 갱신 실패 - 다음 주기에 재시도", fg="#FF6B6B")
-            self._schedule_chart_auto_refresh()
+            if self._has_auto_refresh_target() and not self.chart_auto_refresh_job:
+                self._schedule_chart_auto_refresh()
 
     def _close_chart_window(self):
-        self._cancel_chart_auto_refresh()
         try:
             if self.chart_win and self.chart_win.winfo_exists():
                 self.chart_win.destroy()
@@ -1502,6 +1532,338 @@ class PortfolioApp:
         self.report_text_widget = None
         self.daily_window_scale = None
         self.daily_window_label = None
+        if not self._has_auto_refresh_target():
+            self._cancel_chart_auto_refresh()
+
+    def _pnl_color(self, value: float) -> str:
+        if value > 0:
+            return "#3FB950"
+        if value < 0:
+            return "#F85149"
+        return self.MUTED
+
+    def _close_compact_pnl_window(self, _event=None):
+        try:
+            if self.compact_pnl_win and self.compact_pnl_win.winfo_exists():
+                self.compact_pnl_win.destroy()
+        except Exception:
+            pass
+        self.compact_pnl_win = None
+        self.compact_pnl_label = None
+        self.compact_roi_label = None
+        self.compact_usd_label = None
+        self.compact_jpy_label = None
+        self.compact_kospi_label = None
+        self.compact_cat_stock_label = None
+        self.compact_cat_bond_label = None
+        self.compact_cat_gold_label = None
+        self.compact_cat_comm_label = None
+        self.compact_cat_cash_label = None
+        self.compact_pnl_updated_label = None
+        if not self._has_auto_refresh_target():
+            self._cancel_chart_auto_refresh()
+        return "break"
+
+    def _format_value_with_chg(self, base_text: str, chg) -> tuple[str, str]:
+        """값 텍스트 옆에 전일 대비 등락률을 붙이고, 등락 색을 돌려준다."""
+        try:
+            chg_f = float(chg) if chg is not None else None
+        except (TypeError, ValueError):
+            chg_f = None
+        if chg_f is None:
+            return base_text, self.FG
+        sign = "+" if chg_f > 0 else ""
+        return f"{base_text}  ({sign}{chg_f:.2f}%)", self._pnl_color(chg_f)
+
+    def _format_category_day_chg(self, chg_amt, chg_pct) -> tuple[str, str]:
+        """자산군 전일 대비 금액·등락률 표시 텍스트."""
+        try:
+            amt = float(chg_amt) if chg_amt is not None else None
+        except (TypeError, ValueError):
+            amt = None
+        try:
+            pct = float(chg_pct) if chg_pct is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        if amt is None and pct is None:
+            return "-", self.MUTED
+        parts = []
+        color_src = amt if amt is not None else pct
+        if amt is not None:
+            sign = "+" if amt > 0 else ""
+            parts.append(f"{sign}{int(round(amt)):,}원")
+        if pct is not None:
+            sign = "+" if pct > 0 else ""
+            parts.append(f"({sign}{pct:.2f}%)")
+        return "  ".join(parts), self._pnl_color(float(color_src or 0.0))
+
+    def _category_day_changes_from_history(
+        self,
+        history_data: dict | None,
+        categories: tuple[str, ...] = ("주식", "채권", "금", "원자재", "현금성 자산"),
+    ) -> dict:
+        """
+        portfolio_history의 전일 allocation.amount 대비 오늘 평가금액 변화를 계산한다.
+        예수금(KRW/USD/JPY)은 월급 입금 등으로 전일대비가 왜곡되므로 제외한다.
+        """
+        result = {c: {"chg_amt": None, "chg_pct": None, "amount": 0.0} for c in categories}
+        hist = history_data or {}
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        dates = sorted(str(k) for k in hist.keys())
+        prev_dates = [d for d in dates if d < today]
+        today_alloc = ((hist.get(today) or {}).get("allocation")) or {}
+        prev_alloc = ((hist.get(prev_dates[-1]) or {}).get("allocation")) if prev_dates else {}
+
+        def _amt(alloc: dict, key: str) -> float:
+            try:
+                return float((alloc.get(key) or {}).get("amount", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        for cat in categories:
+            cur = _amt(today_alloc, cat)
+            old = _amt(prev_alloc, cat) if prev_dates else None
+            result[cat]["amount"] = cur
+            if old is None:
+                continue
+            result[cat]["chg_amt"] = cur - old
+            if old > 0:
+                result[cat]["chg_pct"] = (cur - old) / old * 100.0
+        return result
+
+    def _latest_pure_day_performance_from_history(
+        self, history_data: dict | None
+    ) -> tuple[float | None, float | None]:
+        """
+        보고서 두 번째 그래프(직전 기록 대비 순수 성과)와 동일한 공식.
+        순수 손익(원) = Δ평가 − Δ원금(=입출금 추정)
+        수익률(%) = 일간 모드와 같이 영업일 환산(복리) 적용.
+        returns: (순수손익_원, 순수수익률_%)
+        """
+        hist = history_data or {}
+        if not hist:
+            return None, None
+        try:
+            df = pd.DataFrame.from_dict(hist, orient="index")
+            if "principal" not in df.columns:
+                df["principal"] = np.nan
+            if "value" not in df.columns:
+                df["value"] = np.nan
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+            if df.empty:
+                return None, None
+            _hset = _kr_holiday_date_set(df.index.min(), df.index.max())
+            df = df.loc[df.index.map(lambda t: _is_kr_business_day(t, _hset))]
+            if len(df) < 2:
+                return None, None
+
+            vals = df["value"].astype(float).ffill().bfill().fillna(0.0)
+            prins = df["principal"].astype(float).ffill().bfill().fillna(0.0)
+            prev_vals = vals.shift(1)
+            net_flow = prins.diff().fillna(0.0)
+            pure_won = vals - prev_vals - net_flow
+            pure_raw_pct = (pure_won / prev_vals.replace(0, np.nan)) * 100.0
+            pure_raw_pct = pure_raw_pct.replace([np.inf, -np.inf], np.nan)
+
+            n_pts = len(df)
+            bd_after_prev = np.ones(n_pts, dtype=np.float64)
+            dates = df.index
+            for i in range(1, n_pts):
+                bd_after_prev[i] = float(
+                    _count_kr_bdays_after_prev(dates[i - 1], dates[i], _hset)
+                )
+
+            pure_day_pct = pure_raw_pct.to_numpy(dtype=np.float64, copy=True)
+            inv_n = 1.0 / bd_after_prev
+            rf = pure_day_pct / 100.0
+            base = 1.0 + rf
+            safe = np.isfinite(rf) & (base > 0) & (bd_after_prev > 1)
+            pure_day_pct[safe] = (np.power(base[safe], inv_n[safe]) - 1.0) * 100.0
+
+            last_won = float(pure_won.iloc[-1])
+            last_pct = float(pure_day_pct[-1])
+            if not math.isfinite(last_won):
+                last_won = None
+            if not math.isfinite(last_pct):
+                last_pct = None
+            return last_won, last_pct
+        except Exception:
+            return None, None
+
+    def _update_compact_pnl_labels(self, total_prof: float, total_roi: float):
+        if not (self.compact_pnl_win and self.compact_pnl_win.winfo_exists()):
+            return
+        prof_color = self._pnl_color(total_prof)
+        roi_color = self._pnl_color(total_roi)
+        prof_sign = "+" if total_prof > 0 else ""
+        roi_sign = "+" if total_roi > 0 else ""
+        if self.compact_pnl_label and self.compact_pnl_label.winfo_exists():
+            base = f"{prof_sign}{int(total_prof):,}원"
+            # 보고서 2번째 그래프(직전 기록 대비 순수 성과)와 동일 수치
+            day_chg = getattr(self, "current_total_value_day_chg", None)
+            day_pct = getattr(self, "current_pure_day_pct", None)
+            if day_chg is not None:
+                try:
+                    day_f = float(day_chg)
+                    dsign = "+" if day_f > 0 else ""
+                    extra = f"직전대비 순수 {dsign}{int(round(day_f)):,}원"
+                    if day_pct is not None:
+                        try:
+                            pct_f = float(day_pct)
+                            psign = "+" if pct_f > 0 else ""
+                            extra += f" ({psign}{pct_f:.2f}%)"
+                        except (TypeError, ValueError):
+                            pass
+                    base = f"{base}  ({extra})"
+                except (TypeError, ValueError):
+                    pass
+            self.compact_pnl_label.config(text=base, fg=prof_color)
+        if self.compact_roi_label and self.compact_roi_label.winfo_exists():
+            self.compact_roi_label.config(
+                text=f"{roi_sign}{total_roi:.2f}%",
+                fg=roi_color,
+            )
+        usd_rate = float(getattr(self, "current_exchange_rate", 1400.0) or 1400.0)
+        jpy_rate = float(getattr(self, "current_jpy_exchange_rate", 9.5) or 9.5)
+        kospi = float(getattr(self, "current_kospi", 0.0) or 0.0)
+        if self.compact_usd_label and self.compact_usd_label.winfo_exists():
+            txt, color = self._format_value_with_chg(
+                f"{usd_rate:,.2f}원",
+                getattr(self, "current_usd_chg", None),
+            )
+            self.compact_usd_label.config(text=txt, fg=color)
+        if self.compact_jpy_label and self.compact_jpy_label.winfo_exists():
+            txt, color = self._format_value_with_chg(
+                f"{jpy_rate * 100.0:,.2f}원",
+                getattr(self, "current_jpy_chg", None),
+            )
+            self.compact_jpy_label.config(text=txt, fg=color)
+        if self.compact_kospi_label and self.compact_kospi_label.winfo_exists():
+            base = f"{kospi:,.2f}" if kospi > 0 else "-"
+            txt, color = self._format_value_with_chg(base, getattr(self, "current_kospi_chg", None))
+            self.compact_kospi_label.config(text=txt if kospi > 0 else "-", fg=color if kospi > 0 else self.MUTED)
+
+        cat_map = getattr(self, "current_category_day_chg", {}) or {}
+        for cat, lbl_attr in (
+            ("주식", "compact_cat_stock_label"),
+            ("채권", "compact_cat_bond_label"),
+            ("금", "compact_cat_gold_label"),
+            ("원자재", "compact_cat_comm_label"),
+            ("현금성 자산", "compact_cat_cash_label"),
+        ):
+            lbl = getattr(self, lbl_attr, None)
+            if not (lbl and lbl.winfo_exists()):
+                continue
+            info = cat_map.get(cat) or {}
+            txt, color = self._format_category_day_chg(info.get("chg_amt"), info.get("chg_pct"))
+            lbl.config(text=txt, fg=color)
+
+        if self.compact_pnl_updated_label and self.compact_pnl_updated_label.winfo_exists():
+            now_txt = datetime.datetime.now().strftime("%H:%M:%S")
+            self.compact_pnl_updated_label.config(text=f"30초마다 자동 갱신 · 마지막 {now_txt}")
+
+    def show_compact_pnl_window(self, total_prof: float, total_roi: float, *, raise_window: bool = False):
+        """통합 손익·수익률·환율·시장지표·자산군 전일대비를 보여주는 독립 창."""
+        if self.compact_pnl_win and self.compact_pnl_win.winfo_exists():
+            self._update_compact_pnl_labels(total_prof, total_roi)
+            if raise_window:
+                try:
+                    self.compact_pnl_win.lift()
+                except Exception:
+                    pass
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("통합 손익 · 시장 요약")
+        win.configure(bg=self.BG)
+        win.geometry("360x480")
+        win.minsize(300, 420)
+        # 보고서 창과 묶지 않는 독립 창 (transient 미사용)
+        win.protocol("WM_DELETE_WINDOW", self._close_compact_pnl_window)
+        try:
+            win.bind("<Escape>", self._close_compact_pnl_window)
+        except Exception:
+            pass
+
+        font_caption_sm = (self.FONT_MAIN[0], 8)
+        font_value_sm = (self.FONT_MAIN[0], 11, "bold")
+
+        card = tk.Frame(win, bg=self.CARD_BG, highlightthickness=1, highlightbackground=self.BORDER)
+        card.pack(fill="both", expand=True, padx=6, pady=6)
+
+        def _add_row(caption: str) -> tk.Label:
+            tk.Label(
+                card,
+                text=caption,
+                bg=self.CARD_BG,
+                fg=self.MUTED,
+                font=font_caption_sm,
+            ).pack(anchor="w", padx=8, pady=(6, 0) if caption == "통합 손익금" else (2, 0))
+            lbl = tk.Label(
+                card,
+                text="",
+                bg=self.CARD_BG,
+                fg=self.FG,
+                font=font_value_sm,
+            )
+            lbl.pack(anchor="w", padx=8, pady=(1, 4))
+            return lbl
+
+        self.compact_pnl_label = _add_row("통합 손익금")
+        self.compact_roi_label = _add_row("통합 수익률")
+        self.compact_usd_label = _add_row("USD 환율 (KRW/USD)")
+        self.compact_jpy_label = _add_row("JPY 환율 (원/100엔)")
+        self.compact_kospi_label = _add_row("코스피")
+        self.compact_cat_stock_label = _add_row("주식 (전일 대비)")
+        self.compact_cat_bond_label = _add_row("채권 (전일 대비)")
+        self.compact_cat_gold_label = _add_row("금 (전일 대비)")
+        self.compact_cat_comm_label = _add_row("원자재 (전일 대비)")
+        self.compact_cat_cash_label = _add_row("현금성 자산 (전일 대비)")
+
+        self.compact_pnl_updated_label = tk.Label(
+            card,
+            text="",
+            bg=self.CARD_BG,
+            fg=self.MUTED,
+            font=font_caption_sm,
+        )
+        self.compact_pnl_updated_label.pack(anchor="w", padx=8, pady=(4, 6))
+
+        self.compact_pnl_win = win
+        self._update_compact_pnl_labels(total_prof, total_roi)
+
+        try:
+            win.update_idletasks()
+            ww, wh = 360, 480
+            if self.chart_win and self.chart_win.winfo_exists():
+                self.chart_win.update_idletasks()
+                cx = self.chart_win.winfo_rootx() + self.chart_win.winfo_width() + 12
+                cy = self.chart_win.winfo_rooty()
+                sw = win.winfo_screenwidth()
+                sh = win.winfo_screenheight()
+                if cx + ww > sw - 10:
+                    cx = max(10, self.chart_win.winfo_rootx() + self.chart_win.winfo_width() - ww - 24)
+                    cy = min(self.chart_win.winfo_rooty() + self.chart_win.winfo_height() + 12, sh - wh - 10)
+                win.geometry(f"{ww}x{wh}+{max(0, cx)}+{max(0, cy)}")
+            else:
+                sx = self.root.winfo_rootx() + self.root.winfo_width() + 16
+                sy = self.root.winfo_rooty()
+                win.geometry(f"{ww}x{wh}+{max(0, sx)}+{max(0, sy)}")
+        except Exception:
+            pass
+
+        try:
+            self._set_window_alpha(win)
+            win.after(50, lambda w=win: self._set_window_alpha(w))
+            win.after(200, lambda w=win: self._set_window_alpha(w))
+        except Exception:
+            pass
+        if raise_window:
+            try:
+                win.lift()
+            except Exception:
+                pass
 
     def _on_daily_window_scroll(self, value):
         if self._updating_daily_window_scale:
@@ -2760,6 +3122,133 @@ class PortfolioApp:
         except Exception:
             return float(getattr(self, "current_jpy_exchange_rate", 9.5) or 9.5)
 
+    def _yahoo_latest_quote_with_change(
+        self, ticker: str, fallback: float = 0.0
+    ) -> tuple[float, float | None]:
+        """
+        Yahoo 최신 시세와 전일 대비 등락률(%).
+        일봉 종가만 쓰면 휴장·장전·시차 때문에 하루 전 값이 남을 수 있어
+        fast_info → 분봉 → 일봉 순으로 본다.
+        """
+        fallback = float(fallback or 0.0)
+        last = 0.0
+        closes: list[float] = []
+        try:
+            t = yf.Ticker(ticker)
+            try:
+                hist = t.history(period="10d", interval="1d", auto_adjust=True)
+                if hist is not None and not hist.empty:
+                    closes = [float(x) for x in hist["Close"].tolist() if float(x) > 0]
+            except Exception:
+                closes = []
+
+            try:
+                last = float(getattr(t.fast_info, "last_price", 0.0) or 0.0)
+            except Exception:
+                last = 0.0
+            if last <= 0:
+                try:
+                    hist_m = t.history(period="2d", interval="5m", auto_adjust=True)
+                    if hist_m is not None and not hist_m.empty:
+                        last = float(hist_m["Close"].iloc[-1])
+                except Exception:
+                    pass
+            if last <= 0 and closes:
+                last = float(closes[-1])
+
+            if last > 0 and closes:
+                settled = float(closes[-1])
+                if settled > 0 and abs(last - settled) / settled <= 1e-4:
+                    prev = float(closes[-2]) if len(closes) >= 2 else None
+                else:
+                    prev = settled
+                if prev and prev > 0:
+                    return last, (last / prev - 1.0) * 100.0
+            if last > 0:
+                return last, None
+        except Exception:
+            pass
+        return fallback, None
+
+    def _yahoo_latest_quote(self, ticker: str, fallback: float = 0.0) -> float:
+        value, _chg = self._yahoo_latest_quote_with_change(ticker, fallback=fallback)
+        return value
+
+    def get_kospi_quote(self) -> tuple[float, float | None]:
+        """코스피 지수와 전일 대비 등락률(%). 네이버 우선, 실패 시 Yahoo ^KS11."""
+        fallback = float(getattr(self, "current_kospi", 0.0) or 0.0)
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://m.stock.naver.com/",
+        }
+        # 1) 네이버 모바일 지수 API
+        try:
+            res = requests.get(
+                "https://m.stock.naver.com/api/index/KOSPI/basic",
+                headers=headers,
+                timeout=5,
+            )
+            if res.ok:
+                data = res.json() if res.content else {}
+                if isinstance(data, dict):
+                    price = 0.0
+                    for key in ("closePrice", "dealPrice", "nowVal"):
+                        raw = data.get(key)
+                        if raw is None:
+                            continue
+                        try:
+                            price = float(str(raw).replace(",", "").strip())
+                        except (TypeError, ValueError):
+                            continue
+                        if price > 0:
+                            break
+                    chg = None
+                    raw_chg = data.get("fluctuationsRatio")
+                    if raw_chg is not None:
+                        try:
+                            chg = float(str(raw_chg).replace(",", "").strip())
+                        except (TypeError, ValueError):
+                            chg = None
+                    if price > 0:
+                        return price, chg
+        except Exception:
+            pass
+        # 2) 네이버 폴링 API (nv/cv는 *100 스케일, cr은 %)
+        try:
+            res = requests.get(
+                "https://polling.finance.naver.com/api/realtime?query=SERVICE_INDEX:KOSPI",
+                headers=headers,
+                timeout=5,
+            )
+            if res.ok:
+                data = res.json() if res.content else {}
+                areas = ((data.get("result") or {}).get("areas") or [])
+                for area in areas:
+                    for row in (area.get("datas") or []):
+                        if str(row.get("cd", "")).upper() != "KOSPI":
+                            continue
+                        try:
+                            nv = float(row.get("nv") or 0)
+                        except (TypeError, ValueError):
+                            nv = 0.0
+                        chg = None
+                        try:
+                            if row.get("cr") is not None:
+                                chg = float(row.get("cr"))
+                        except (TypeError, ValueError):
+                            chg = None
+                        if nv > 0:
+                            return nv / 100.0, chg
+        except Exception:
+            pass
+        return self._yahoo_latest_quote_with_change("^KS11", fallback=fallback if fallback > 0 else 0.0)
+
+    def get_kospi_index(self) -> float:
+        """코스피 지수(값만)."""
+        value, _chg = self.get_kospi_quote()
+        return value
+
     def get_kr_price(self, code):
         """
         국내(KRX) 종목 현재가.
@@ -3110,10 +3599,21 @@ class PortfolioApp:
                 return
 
             self.lbl_status.config(text="실시간 시세 및 수익률 계산 중...", fg="#FFFF00")
-            self.root.update()
+            # 자동 갱신에서는 root.update()가 포커스/주의 요청(알림)을 유발할 수 있어 idletasks만 돌린다.
+            if in_place_refresh:
+                self.root.update_idletasks()
+            else:
+                self.root.update()
 
-            exchange_rate = self.get_exchange_rate()
-            jpy_exchange_rate = self.get_jpy_exchange_rate()
+            exchange_rate, usd_chg = self._yahoo_latest_quote_with_change(
+                "KRW=X",
+                fallback=float(getattr(self, "current_exchange_rate", 1420.0) or 1420.0),
+            )
+            jpy_exchange_rate, jpy_chg = self._yahoo_latest_quote_with_change(
+                "JPYKRW=X",
+                fallback=float(getattr(self, "current_jpy_exchange_rate", 9.5) or 9.5),
+            )
+            kospi_index, kospi_chg = self.get_kospi_quote()
             asset_values = defaultdict(float)
             report_data = []
 
@@ -3311,6 +3811,10 @@ class PortfolioApp:
             total_roi = (total_profit / total_prin * 100) if total_prin > 0 else 0
 
             self.history_data = self.save_and_get_history(total_roi, total_prin, total_val, macro_alloc)
+            self.current_category_day_chg = self._category_day_changes_from_history(self.history_data)
+            pure_won, pure_pct = self._latest_pure_day_performance_from_history(self.history_data)
+            self.current_total_value_day_chg = pure_won
+            self.current_pure_day_pct = pure_pct
 
             self.current_asset_values = asset_values
             self.current_macro_alloc = macro_alloc
@@ -3323,17 +3827,32 @@ class PortfolioApp:
             self.current_report_data = report_data
             self.current_exchange_rate = exchange_rate
             self.current_jpy_exchange_rate = jpy_exchange_rate
+            self.current_kospi = kospi_index
+            self.current_usd_chg = usd_chg
+            self.current_jpy_chg = jpy_chg
+            self.current_kospi_chg = kospi_chg
 
             self.lbl_status.config(text="계산 완료! 통합 수익률 확인", fg="#00FF00")
-            if in_place_refresh and self.chart_win and self.chart_win.winfo_exists():
-                self.refresh_chart_and_report(report_data, total_prin, total_val, total_profit, total_roi, exchange_rate)
+            chart_alive = bool(self.chart_win and self.chart_win.winfo_exists())
+            compact_alive = bool(self.compact_pnl_win and self.compact_pnl_win.winfo_exists())
+            if in_place_refresh and (chart_alive or compact_alive):
+                if chart_alive:
+                    self.refresh_chart_and_report(
+                        report_data, total_prin, total_val, total_profit, total_roi, exchange_rate
+                    )
+                self.show_compact_pnl_window(total_profit, total_roi, raise_window=False)
             else:
-                self.show_chart_and_report(report_data, total_prin, total_val, total_profit, total_roi, exchange_rate)
+                self.show_chart_and_report(
+                    report_data, total_prin, total_val, total_profit, total_roi, exchange_rate
+                )
 
         except Exception:
             err_msg = traceback.format_exc()
             messagebox.showerror("데이터 수집 에러", f"시세를 불러오는 중 오류가 발생했습니다.\n\n{err_msg}")
             self.lbl_status.config(text="오류 발생 - 계산 중단", fg="#FF6B6B")
+        finally:
+            if self._has_auto_refresh_target():
+                self._schedule_chart_auto_refresh()
 
     def show_chart_and_report(self, report_data, total_prin, total_val, total_prof, total_roi, ex_rate):
         try:
@@ -3454,6 +3973,7 @@ class PortfolioApp:
             self.update_line_chart("일간")
             self.chart_win.update_idletasks()
             self._resize_and_place_chart_win(self.chart_win, desired_w=1100, desired_h=650, reserve_bottom=130)
+            self.show_compact_pnl_window(total_prof, total_roi, raise_window=True)
 
         except Exception:
             err_msg = traceback.format_exc()
@@ -3465,6 +3985,7 @@ class PortfolioApp:
         if self.report_text_widget and self.report_text_widget.winfo_exists():
             self._fill_report_text(self.report_text_widget, report_data, total_prin, total_val, total_prof, total_roi, ex_rate)
         self.update_line_chart(getattr(self, "current_chart_view_mode", "일간"))
+        self._update_compact_pnl_labels(total_prof, total_roi)
 
     def show_account_yield_popup(self):
         if not hasattr(self, 'current_report_data'):
